@@ -1,5 +1,9 @@
 FROM python:3.11-slim
 
+ENV PYTHONUNBUFFERED=1 \
+    PIP_ROOT_USER_ACTION=ignore \
+    PIP_DISABLE_PIP_VERSION_CHECK=1
+
 # ffmpeg = audio stream ke liye, gcc = tgcrypto build fallback
 RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg gcc libc6-dev \
     && rm -rf /var/lib/apt/lists/*
@@ -8,10 +12,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg gcc libc
 COPY --from=denoland/deno:bin /deno /usr/local/bin/deno
 
 WORKDIR /app
-COPY requirements_4-11.txt .
-RUN pip install --no-cache-dir -r requirements_4-11.txt
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
 
-COPY main.py db.py panel.py songs.csv ./
+COPY main.py media.py db.py panel.py songs.csv ./
+COPY assets ./assets
 
-# Har restart par yt-dlp update (YouTube roz badalta hai), fir bot start
-CMD ["sh", "-c", "pip install -U -q 'yt-dlp[default]'; python main.py"]
+# Har restart par yt-dlp update (YouTube roz badalta hai). Update fail ho to bhi bot start hoga.
+# `exec` zaroori hai: tabhi redeploy ka SIGTERM python tak pahunchta hai (graceful shutdown message).
+CMD ["sh", "-c", "pip install -U -q 'yt-dlp[default]' || true; exec python main.py"]

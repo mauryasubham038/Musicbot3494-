@@ -9,6 +9,7 @@ Gaane, users ya queue ka koi record nahi rakha jata.
 import os
 import re
 import sqlite3
+import threading
 import time
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
@@ -18,6 +19,9 @@ ERROR_TTL = 24 * 60 * 60  # 1 din
 
 os.makedirs(os.path.dirname(DB_PATH) or ".", exist_ok=True)
 con = sqlite3.connect(DB_PATH, check_same_thread=False)
+_lock = threading.RLock()  # db is used from the event loop AND worker threads
+con.execute("PRAGMA journal_mode=WAL")
+con.execute("PRAGMA synchronous=NORMAL")
 con.executescript("""
 CREATE TABLE IF NOT EXISTS groups (
     chat_id INTEGER PRIMARY KEY, title TEXT, active INTEGER NOT NULL,
@@ -31,6 +35,9 @@ CREATE TABLE IF NOT EXISTS errors (
     id INTEGER PRIMARY KEY AUTOINCREMENT, ts REAL NOT NULL,
     chat_id INTEGER, msg TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS searches (
+    key TEXT PRIMARY KEY, title TEXT, page TEXT NOT NULL, duration INTEGER, ts REAL NOT NULL
+);
 CREATE INDEX IF NOT EXISTS ix_events_ts ON events(ts);
 CREATE INDEX IF NOT EXISTS ix_errors_ts ON errors(ts);
 """)
@@ -40,11 +47,23 @@ _ANSI = re.compile(r"\x1b\[[0-9;]*m")
 _VIDEO_ID = re.compile(r"(\[[^\]]+\]) [\w-]{6,}:")
 
 
+def _locked(fn):
+    import functools
+
+    @functools.wraps(fn)
+    def w(*a, **k):
+        with _lock:
+            return fn(*a, **k)
+    return w
+
+
 def _q(sql, *a):
-    return con.execute(sql, a).fetchall()
+    with _lock:
+        return con.execute(sql, a).fetchall()
 
 
 # ---------- groups ----------
+@_locked
 def mark_added(chat_id: int, title: str | None):
     row = _q("SELECT active FROM groups WHERE chat_id=?", chat_id)
     now = time.time()
@@ -59,6 +78,7 @@ def mark_added(chat_id: int, title: str | None):
     con.commit()
 
 
+@_locked
 def mark_left(chat_id: int, title: str | None):
     row = _q("SELECT active, title FROM groups WHERE chat_id=?", chat_id)
     if not row or row[0][0] != 1:
@@ -70,6 +90,7 @@ def mark_left(chat_id: int, title: str | None):
     con.commit()
 
 
+@_locked
 def seen(chat_id: int, title: str | None):
     """Group me koi command aaya. Naya group ho to chupchap list me jodo (add event nahi)."""
     row = _q("SELECT active FROM groups WHERE chat_id=?", chat_id)
@@ -86,6 +107,7 @@ def active_group_ids() -> list[int]:
 
 
 # ---------- errors ----------
+@_locked
 def log_error(chat_id: int | None, where: str, ex: Exception | None = None):
     msg = where if ex is None else f"{where}: {type(ex).__name__}: {ex}"
     msg = _ANSI.sub("", msg).replace("ERROR: ", "").strip()
@@ -95,8 +117,25 @@ def log_error(chat_id: int | None, where: str, ex: Exception | None = None):
     con.commit()
 
 
+@_locked
 def cleanup_errors():
     con.execute("DELETE FROM errors WHERE ts < ?", (time.time() - ERROR_TTL,))
+    con.execute("DELETE FROM searches WHERE ts < ?", (time.time() - 30 * 24 * 3600,))
+    con.commit()
+
+
+# ---------- persistent search cache (used by media.py) ----------
+def search_get(key: str, ttl: float) -> dict | None:
+    row = _q("SELECT title, page, duration, ts FROM searches WHERE key=?", key)
+    if row and time.time() - row[0][3] < ttl:
+        return {"title": row[0][0], "page": row[0][1], "duration": row[0][2]}
+    return None
+
+
+@_locked
+def search_put(key: str, res: dict):
+    con.execute("INSERT OR REPLACE INTO searches(key,title,page,duration,ts) VALUES(?,?,?,?,?)",
+                (key, res.get("title"), res["page"], res.get("duration"), time.time()))
     con.commit()
 
 
@@ -133,7 +172,8 @@ def stats(tzname: str = "Asia/Kolkata") -> dict:
         if m == 0:
             y, m = y - 1, 12
     first_month = min(months)
-    for ts, kind in _q("SELECT ts, kind FROM events"):
+    first_ts = datetime(first_month[0], first_month[1], 1, tzinfo=tz).timestamp()
+    for ts, kind in _q("SELECT ts, kind FROM events WHERE ts>=?", first_ts):
         dt = datetime.fromtimestamp(ts, tz)
         k = (dt.year, dt.month)
         if k in months and k >= first_month:

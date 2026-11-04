@@ -5,10 +5,14 @@ import asyncio
 import base64
 import hmac
 import os
+import time
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
 from aiohttp import web
 
 import db
+import media
 
 ADMIN_USER = os.environ.get("ADMIN_USER", "admin")
 ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "")
@@ -19,10 +23,23 @@ def _eq(a: str, b: str) -> bool:
     return hmac.compare_digest(a.encode(), b.encode())
 
 
+_fails: dict[str, list[float]] = {}  # ip -> failed login times (brute force limiter)
+
+
+def _ip(request: web.Request) -> str:
+    xf = request.headers.get("X-Forwarded-For", "")
+    # last entry = the one added by our own proxy (first entry can be faked by the client)
+    return (xf.split(",")[-1].strip() if xf else request.remote) or "?"
+
+
 @web.middleware
 async def auth(request: web.Request, handler):
     if request.path == "/health":
         return await handler(request)
+    ip, now = _ip(request), time.time()
+    recent = [t for t in _fails.get(ip, []) if now - t < 600]
+    if len(recent) >= 8:
+        return web.Response(status=429, text="Too many attempts, try again in 10 minutes.")
     ok = False
     h = request.headers.get("Authorization", "")
     if h.startswith("Basic "):
@@ -32,9 +49,15 @@ async def auth(request: web.Request, handler):
         except Exception:
             ok = False
     if not ok:
-        await asyncio.sleep(1)  # brute force slow karne ke liye
+        if h:  # a real wrong attempt (the first browser request without credentials is free)
+            recent.append(now)
+            if len(_fails) > 2000:
+                _fails.clear()
+            _fails[ip] = recent
+        await asyncio.sleep(1)
         return web.Response(status=401, text="Unauthorized",
                             headers={"WWW-Authenticate": 'Basic realm="Bot Admin"'})
+    _fails.pop(ip, None)
     return await handler(request)
 
 
@@ -43,8 +66,11 @@ async def index(_):
 
 
 async def api_stats(_):
-    d = db.stats(TIMEZONE)
+    d = await asyncio.to_thread(db.stats, TIMEZONE)  # heavy queries off the event loop
     d["library"] = library
+    tz = ZoneInfo(TIMEZONE)
+    d["cookies"] = [dict(c, last_ok=(datetime.fromtimestamp(c["last_ok"], tz).strftime("%d %b, %I:%M %p")
+                                     if c["last_ok"] else "-")) for c in media.cookie_status()]
     return web.json_response(d)
 
 
@@ -90,6 +116,18 @@ async def api_broadcast_send(request: web.Request):
     return web.json_response({"ok": True})
 
 
+async def api_cookie_retry(request: web.Request):
+    if request.content_type != "application/json" or request.headers.get("X-Admin") != "1":
+        return web.json_response({"error": "Bad request"}, status=400)
+    try:
+        name = ((await request.json()).get("name") or "").strip()
+    except Exception:
+        name = ""
+    if not media.cookie_reset(name):
+        return web.json_response({"error": "Cookie not found"}, status=404)
+    return web.json_response({"ok": True})
+
+
 async def health(_):
     return web.Response(text="ok")
 
@@ -102,6 +140,7 @@ async def start():
     app.add_routes([web.get("/", index), web.get("/api/stats", api_stats),
                     web.get("/api/broadcast", api_broadcast_status),
                     web.post("/api/broadcast", api_broadcast_send),
+                    web.post("/api/cookie/retry", api_cookie_retry),
                     web.get("/health", health)])
     runner = web.AppRunner(app)
     await runner.setup()
@@ -155,6 +194,9 @@ button:disabled{opacity:.5}
 .bpad{padding:12px}
 .tag{padding:2px 8px;border-radius:99px;font-size:11px;font-weight:600}
 .tag.add{background:rgba(22,163,74,.15);color:var(--green)}
+.tag.ok{background:rgba(22,163,74,.15);color:var(--green)}
+.tag.blocked{background:rgba(217,119,6,.18);color:var(--amber)}
+.tag.dead{background:rgba(220,38,38,.15);color:var(--red)}
 .tag.leave{background:rgba(220,38,38,.15);color:var(--red)}
 </style>
 </head>
@@ -184,6 +226,9 @@ button:disabled{opacity:.5}
 
   <h2>🎵 Song library <span class="sub">(only you can see this)</span></h2>
   <div class="box" id="library"></div>
+
+  <h2>🍪 YouTube cookies <span class="sub">(status resets on restart)</span></h2>
+  <div class="box" id="cookies"></div>
 
   <h2>Errors <span class="sub">(last 24h: <span id="errors_24h">0</span>, auto-deleted after 1 day)</span></h2>
   <div class="box" id="errors_grouped"></div>
@@ -224,6 +269,12 @@ async function load() {
       lib.languages.map(x => [td(x.language), td(x.songs), td(x.singers)])
         .concat([['<td><b>Total</b></td>', '<td><b>' + esc(lib.total_songs) + '</b></td>', '<td><b>' + esc(lib.total_singers) + '</b></td>']]),
       'No songs loaded (songs.csv missing?).');
+    table($('cookies'), ['Cookie', 'Status', 'Used', 'Blocked', 'Last OK', 'Last error', ''],
+      (d.cookies || []).map(c => [td(c.name),
+        '<td><span class="tag ' + esc(c.status) + '">' + (c.status === 'ok' ? 'OK' : c.status === 'blocked' ? 'BLOCKED (' + esc(c.rest_min) + ' min)' : 'DEAD') + '</span></td>',
+        td(c.uses), td(c.blocks), td(c.last_ok), td(c.last_error, 'wrap'),
+        c.status === 'ok' ? '<td></td>' : '<td><button style="margin:0;padding:4px 10px" onclick="retryC(\'' + esc(c.name) + '\')">Retry now</button></td>']),
+      'No cookies loaded (set COOKIES_B64, COOKIES_B64_1, ...).');
     table($('errors_grouped'), ['Error', 'Times', 'Groups', 'Last'],
       d.errors_grouped.map(e => [td(e.msg, 'wrap'), td(e.count), td(e.groups), td(e.last)]), 'No errors in the last 24 hours 🎉');
     table($('errors_recent'), ['Time', 'Group', 'Error'],
@@ -241,6 +292,11 @@ async function load() {
   } catch (e) {
     $('now').textContent = 'Failed to load, retrying...';
   }
+}
+async function retryC(name) {
+  await fetch('/api/cookie/retry', {method: 'POST',
+    headers: {'Content-Type': 'application/json', 'X-Admin': '1'}, body: JSON.stringify({name})});
+  load();
 }
 function renderB(s) {
   let t = '';

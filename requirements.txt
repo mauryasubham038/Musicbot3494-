@@ -1,4 +1,6 @@
-pyrogram==2.0.106
+# Upper bounds stop a surprise major upgrade from breaking a redeploy.
+# After the first successful deploy run `pip freeze` in the container and pin exact versions.
+kurigram>=2.1,<3
 tgcrypto
 py-tgcalls>=2.1,<3
 yt-dlp[default]

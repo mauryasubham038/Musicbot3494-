@@ -1,5 +1,5 @@
 {
   "$schema": "https://railway.com/railway.json",
   "build": { "builder": "DOCKERFILE", "dockerfilePath": "Dockerfile" },
-  "deploy": { "restartPolicyType": "ALWAYS" }
+  "deploy": { "restartPolicyType": "ON_FAILURE", "restartPolicyMaxRetries": 10 }
 }

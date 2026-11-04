@@ -5,16 +5,18 @@ try:
 except RuntimeError:
     asyncio.set_event_loop(asyncio.new_event_loop())
 
-import base64
 import csv
+import html
+import logging
 import os
 import random
 import re
+import time
 from collections import defaultdict
 
 from dotenv import load_dotenv
 from pyrogram import Client, filters, idle
-from pyrogram.enums import ChatMemberStatus, ChatType
+from pyrogram.enums import ChatMemberStatus, ChatType, ParseMode
 from pyrogram.types import (
     CallbackQuery,
     ChatMemberUpdated,
@@ -25,60 +27,92 @@ from pyrogram.types import (
 from pytgcalls import PyTgCalls
 from pytgcalls.types import AudioQuality, MediaStream
 from rapidfuzz import fuzz, process
-from yt_dlp import YoutubeDL
 
 import db
+import media
 import panel
 
 load_dotenv()
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+log = logging.getLogger("tgmusic")
 
 API_ID = int(os.environ["API_ID"])
 API_HASH = os.environ["API_HASH"]
 BOT_TOKEN = os.environ["BOT_TOKEN"]
-SESSION_STRING = os.environ["SESSION_STRING"]
-PROXY = os.environ.get("PROXY")  # optional, e.g. http://user:pass@host:port
-COOKIES = "cookies.txt"  # optional (dummy Google account ki cookies)
-# Railway: cookies.txt ka content COOKIES_B64 (base64) ya COOKIES_TXT (plain text) variable me daalo
-if os.environ.get("COOKIES_B64"):
-    open(COOKIES, "wb").write(base64.b64decode(os.environ["COOKIES_B64"]))
-elif os.environ.get("COOKIES_TXT"):
-    open(COOKIES, "w", encoding="utf-8").write(os.environ["COOKIES_TXT"])
 SONGS_CSV = "songs.csv"
-RADIO_COUNT = 10
+RADIO_COUNT = 15  # radio plays this many songs once, then stops (no auto-refill)
+MIN_ARTIST_SONGS = int(os.environ.get("MIN_ARTIST_SONGS", "3"))  # singers with fewer songs are hidden
 
 bot = Client("bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN, in_memory=True)
-assistant = Client("assistant", api_id=API_ID, api_hash=API_HASH,
-                   session_string=SESSION_STRING, in_memory=True)
-call = PyTgCalls(assistant)
+
+
+# ---------------- Assistant pool ----------------
+# One Telegram user account can only be in so many groups / join so fast. For big scale put
+# several accounts in SESSION_STRINGS (comma or newline separated). Each group is assigned to
+# the assistant that currently has the fewest groups and keeps it.
+class Assistant:
+    def __init__(self, idx: int, session: str):
+        self.idx = idx
+        self.client = Client(f"assistant{idx}", api_id=API_ID, api_hash=API_HASH,
+                             session_string=session, in_memory=True)
+        self.call = PyTgCalls(self.client)
+        self.join_lock = asyncio.Lock()  # joins are spaced out -> no FloodWait
+        self.chats = 0
+
+    @property
+    def tag(self) -> str:
+        me = getattr(self.client, "me", None)
+        return f"@{me.username}" if me and getattr(me, "username", None) else f"assistant {self.idx + 1}"
+
+
+_sessions: list[str] = []
+for _s in re.split(r"[,\s]+", (os.environ.get("SESSION_STRINGS", "") + "," +
+                               os.environ.get("SESSION_STRING", ""))):
+    if _s and _s not in _sessions:
+        _sessions.append(_s)
+if not _sessions:
+    raise SystemExit("Set SESSION_STRING (or SESSION_STRINGS for several assistants).")
+ASSISTANTS = [Assistant(i, s) for i, s in enumerate(_sessions)]
+_assigned: dict[int, Assistant] = {}
+
+
+def assistant_for(chat_id: int) -> Assistant:
+    a = _assigned.get(chat_id)
+    if a is None:
+        a = min(ASSISTANTS, key=lambda x: x.chats)
+        a.chats += 1
+        _assigned[chat_id] = a
+    return a
+
+
+def call_for(chat_id: int) -> PyTgCalls:
+    return assistant_for(chat_id).call
+
 
 # Sab kuch RAM me. Restart par sab saaf, koi record nahi.
 queues: dict[int, list[dict]] = {}
 loops: dict[int, bool] = {}
+radio_src: dict[int, tuple[list, str]] = {}  # chat -> (songs, label): radio refills itself
 dm_state: dict[int, dict] = {}  # radio menu state: user_id -> {"chat", "lang"}
 BOT_USERNAME = ""
 BOT_ID = 0
-
-BAD_WORDS = ["remix", "cover", "live", "slowed", "reverb", "karaoke",
-             "instrumental", "8d", "lofi", "sped up", "nightcore", "reaction"]
-GOOD_WORDS = ["official audio", "official video", "official music video", "audio", "lyrical"]
-
 
 # ---------------- Radio data (songs.csv) ----------------
 SPLIT = re.compile(r"\s+(?:&|x|[Ff]eat\.?|[Ff]t\.?)\s+|\s*,\s+")
 LANG_ORDER = ["Hindi", "Punjabi", "Haryanvi", "English"]
 LANGS: list[str] = []
 SONGS: dict[str, dict[str, list[tuple]]] = {}  # lang -> artist -> [(title, full_artist)]
-ARTISTS: dict[str, list[str]] = {}  # lang -> artists sorted by song count
+ARTISTS: dict[str, list[str]] = {}  # lang -> artists (>= MIN_ARTIST_SONGS) sorted by song count
 LANG_ALL: dict[str, list[tuple]] = {}  # lang -> every song
 
 
 def load_songs():
     if not os.path.exists(SONGS_CSV):
-        print("songs.csv not found, /radio disabled")
+        log.warning("songs.csv not found, /radio disabled")
         return
     tmp: dict[str, dict[str, list]] = defaultdict(lambda: defaultdict(list))
     allsongs: dict[str, list] = defaultdict(list)
-    with open(SONGS_CSV, encoding="utf-8") as f:
+    with open(SONGS_CSV, encoding="utf-8-sig") as f:
         for r in csv.DictReader(f):
             title, full, lang = r["title"].strip(), r["artist"].strip(), r["language"].strip()
             if not (title and full and lang):
@@ -90,169 +124,327 @@ def load_songs():
     LANGS.extend(langs)
     for l in langs:
         SONGS[l] = dict(tmp[l])
-        ARTISTS[l] = sorted(tmp[l], key=lambda a: (-len(tmp[l][a]), a.lower()))
+        names = sorted(tmp[l], key=lambda a: (-len(tmp[l][a]), a.lower()))
+        ARTISTS[l] = [a for a in names if len(tmp[l][a]) >= MIN_ARTIST_SONGS] or names
         LANG_ALL[l] = allsongs[l]
 
 
 load_songs()
 
 
-# ---------------- Search ----------------
-def _ydl(extra=None):
-    opts = {"quiet": True, "no_warnings": True, "noplaylist": True}
-    if os.path.exists(COOKIES):
-        opts["cookiefile"] = COOKIES
-    if PROXY:
-        opts["proxy"] = PROXY
-    if extra:
-        opts.update(extra)
-    return YoutubeDL(opts)
-
-
-def _score(query: str, e: dict) -> float:
-    title = (e.get("title") or "").lower()
-    channel = (e.get("channel") or e.get("uploader") or "").lower()
-    q = query.lower()
-    s = fuzz.token_set_ratio(q, f"{title} {channel}")
-    if any(w in title for w in GOOD_WORDS):
-        s += 8
-    if "topic" in channel or "vevo" in channel or "official" in channel:
-        s += 8
-    for w in BAD_WORDS:
-        if w in title and w not in q:
-            s -= 25
-    dur = e.get("duration") or 0
-    if dur > 900:  # 15 min se lamba = mix/podcast
-        s -= 40
-    if 0 < dur < 45:
-        s -= 30
-    return s
-
-
-def _search_sync(query: str) -> dict | None:
-    for prefix in ("ytsearch5", "scsearch5"):  # YouTube, fir SoundCloud fallback
-        try:
-            with _ydl({"extract_flat": True}) as y:
-                info = y.extract_info(f"{prefix}:{query}", download=False)
-            entries = [e for e in (info.get("entries") or []) if e]
-            if not entries:
-                continue
-            best = max(entries, key=lambda e: _score(query, e))
-            url = best.get("url") or best.get("webpage_url")
-            if url and not url.startswith("http"):
-                url = f"https://www.youtube.com/watch?v={best['id']}"
-            return {"title": best.get("title") or query, "page": url}
-        except Exception:
-            continue
-    return None
-
-
-def _stream_sync(page: str) -> tuple[str, str]:
-    with _ydl({"format": "bestaudio/best"}) as y:
-        info = y.extract_info(page, download=False)
-    return info["url"], info.get("title") or page
-
-
-async def run(fn, *a):
-    return await asyncio.get_running_loop().run_in_executor(None, fn, *a)
-
-
 # ---------------- Player ----------------
+MAX_QUEUE = int(os.environ.get("MAX_QUEUE", "30"))  # songs per group
+PLAY_COOLDOWN = float(os.environ.get("PLAY_COOLDOWN", "3"))  # seconds between /play of one user
+CONTROLS_ADMIN_ONLY = os.environ.get("CONTROLS_ADMIN_ONLY", "1") == "1"  # pause/skip/stop/loop
+STALL_GRACE = int(os.environ.get("STALL_GRACE", "20"))  # watchdog: seconds past song end
+
+_locks: dict[int, asyncio.Lock] = defaultdict(asyncio.Lock)  # one lock per group: no queue races
+_last_play: dict[int, float] = {}  # user_id -> last /play time (anti-spam)
+_joined: set[int] = set()  # groups where the assistant is already a member
+_admin_cache: dict[tuple[int, int], tuple[float, bool]] = {}
+_bg: set[asyncio.Task] = set()  # keeps background tasks alive
+
+
+def spawn(coro) -> None:
+    t = asyncio.create_task(coro)
+    _bg.add(t)
+    t.add_done_callback(_bg.discard)
+
+
+media.in_use_provider = lambda: {s["file"] for q in queues.values() for s in q if s.get("file")}
+
+
+async def say(chat_id: int, text: str, **kw):
+    """send_message that never raises (FloodWait, no permission, kicked...)."""
+    try:
+        return await bot.send_message(chat_id, text, **kw)
+    except Exception as ex:
+        log.warning("send_message to %s failed: %s %s", chat_id, type(ex).__name__, ex)
+        return None
+
+
 def buttons(chat_id: int) -> InlineKeyboardMarkup:
-    lp = "🔁 Loop: ON" if loops.get(chat_id) else "🔁 Loop"
+    lp = "🔂 Loop ON" if loops.get(chat_id) else "🔁 Loop"
     return InlineKeyboardMarkup([[
         InlineKeyboardButton("⏸ Pause", callback_data="pause"),
         InlineKeyboardButton("▶️ Resume", callback_data="resume"),
         InlineKeyboardButton("⏭ Skip", callback_data="skip"),
     ], [
-        InlineKeyboardButton("⏹ Stop", callback_data="stop"),
         InlineKeyboardButton(lp, callback_data="loop"),
+        InlineKeyboardButton("⏹ Stop", callback_data="stop"),
     ]])
 
 
-async def ensure_assistant(chat_id: int):
+def fmt_dur(sec) -> str:
     try:
-        await assistant.get_chat_member(chat_id, "me")
+        sec = int(sec)
+    except (TypeError, ValueError):
+        return "Live"
+    return f"{sec // 60}:{sec % 60:02d} min"
+
+
+def now_playing_text(song: dict) -> str:
+    title = html.escape(song.get("title") or song.get("page") or "Unknown")
+    page = song.get("page")
+    if page and str(page).startswith("http"):
+        title = f'<a href="{html.escape(str(page), quote=True)}">{title}</a>'  # blue clickable title
+    by = html.escape(str(song.get("by") or ""))
+    return (f"<u><b>Started streaming</b></u>\n\n"
+            f"<b>Title:</b> {title}\n\n"
+            f"<b>Duration:</b> {fmt_dur(song.get('duration'))}\n"
+            f"<b>Requested by:</b> {by}")
+
+
+async def is_admin(chat_id: int, user_id: int) -> bool:
+    key = (chat_id, user_id)
+    hit = _admin_cache.get(key)
+    if hit and time.time() - hit[0] < 60:  # cache: fewer Telegram API calls
+        return hit[1]
+    try:
+        m = await bot.get_chat_member(chat_id, user_id)
+        ok = m.status in (ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER)
     except Exception:
-        link = await bot.export_chat_invite_link(chat_id)
-        await assistant.join_chat(link)
+        ok = False
+    if len(_admin_cache) > 5000:
+        _admin_cache.clear()
+    _admin_cache[key] = (time.time(), ok)
+    return ok
 
 
-async def play_next(chat_id: int, announce: bool = True):
-    q = queues.get(chat_id, [])
+async def can_control(chat_id: int, user) -> bool:
+    if not CONTROLS_ADMIN_ONLY:
+        return True
+    return user is not None and await is_admin(chat_id, user.id)
+
+
+async def msg_can_control(m: Message) -> bool:
+    if m.sender_chat and m.sender_chat.id == m.chat.id:  # anonymous admin
+        return True
+    return await can_control(m.chat.id, m.from_user)
+
+
+async def _deny(m: Message) -> bool:
+    """True (and replies) if the sender may not control playback."""
+    if await msg_can_control(m):
+        return False
+    await m.reply_text("🔒 Only admins can control playback.")
+    return True
+
+
+async def ensure_assistant(chat_id: int):
+    if chat_id in _joined:
+        return
+    a = assistant_for(chat_id)
+    try:
+        await a.client.get_chat_member(chat_id, "me")
+    except Exception:
+        async with a.join_lock:
+            link = await bot.export_chat_invite_link(chat_id)
+            try:
+                await a.client.join_chat(link)
+            except Exception as ex:
+                if type(ex).__name__ != "UserAlreadyParticipant":
+                    raise
+            await asyncio.sleep(1.5)  # space out joins of one account (FloodWait protection)
+    _joined.add(chat_id)
+
+
+def join_error_text(ex: Exception, chat_id: int) -> str:
+    n = type(ex).__name__
+    tag = assistant_for(chat_id).tag
+    if "Banned" in n or n == "UserKicked":
+        return f"❌ The assistant {tag} is banned in this group. Unban it and try again."
+    if n == "InviteRequestSent":
+        return f"⏳ Approve the join request of {tag}, then try again."
+    if n == "FloodWait":
+        return "⏳ Telegram is limiting joins right now. Try again in a minute."
+    return "❌ Make me admin (with 'Invite users' permission) and start a voice chat first."
+
+
+async def _prefetch(q: list):
+    """Download the NEXT song while the current one plays -> no gap between songs."""
+    if len(q) < 2:
+        return
+    nxt = q[1]
+    try:
+        if not nxt.get("page"):
+            found = await media.search(nxt["query"])
+            if not found:
+                return
+            nxt["page"] = found["page"]
+            nxt["duration"] = nxt.get("duration") or found.get("duration")
+        path, _t, dur = await media.fetch(nxt["page"])
+        nxt["file"] = path
+        nxt["duration"] = nxt.get("duration") or dur
+    except Exception as ex:
+        log.debug("prefetch failed: %s", ex)
+
+
+def _radio_items(songs: list[tuple]) -> list[dict]:
+    picked = random.sample(songs, min(RADIO_COUNT, len(songs)))
+    return [{"title": f"{t} - {a}", "page": None, "query": f"{t} {a}", "by": "📻 Radio"}
+            for t, a in picked]
+
+
+def _refill_radio(chat_id: int, q: list) -> bool:
+    """Radio does NOT refill: after its songs finish the bot leaves the voice chat."""
+    return False
+
+
+async def _play_locked(chat_id: int, announce: bool = True):
+    """Play queue head. Caller must hold the chat lock."""
+    q = queues.get(chat_id)
     fails = 0
     while q:
+        if queues.get(chat_id) is not q:  # stopped meanwhile
+            return
         song = q[0]
         try:
-            # Search + stream URL sirf play hone se just pehle (kam requests, URL expire nahi hota)
+            # Search + download only right before playing (cache + dedupe live in media.py)
             if not song.get("page"):
-                found = await run(_search_sync, song["query"])
+                found = await media.search(song["query"])
                 if not found:
-                    raise RuntimeError("not found")
+                    raise media.MediaError("Song not found.")
                 song["page"] = found["page"]
-            url, real_title = await run(_stream_sync, song["page"])
+                song["duration"] = song.get("duration") or found.get("duration")
+            path, real_title, dur = await media.fetch(song["page"])
+            song["file"] = path
             song["title"] = song.get("title") or real_title
-            await call.play(chat_id, MediaStream(url, audio_parameters=AudioQuality.HIGH,
-                                                 video_flags=MediaStream.Flags.IGNORE))
-            if announce:
-                await bot.send_message(
-                    chat_id,
-                    f"🎵 Now playing: {song['title']}\nRequested by {song['by']}",
-                    reply_markup=buttons(chat_id),
-                )
-            return
+            song["duration"] = dur or song.get("duration")
+            if queues.get(chat_id) is not q or not q or q[0] is not song:
+                return  # stopped / skipped while downloading
+            await call_for(chat_id).play(
+                chat_id, MediaStream(path, audio_parameters=AudioQuality.HIGH,
+                                     video_flags=MediaStream.Flags.IGNORE))
         except Exception as ex:
-            print("play error:", type(ex).__name__, ex)
+            log.warning("play error in %s: %s %s", chat_id, type(ex).__name__, ex)
             db.log_error(chat_id, "Play failed", ex)
-            if "NoActiveGroupCall" in type(ex).__name__ or "GroupCallNotFound" in type(ex).__name__:
-                await bot.send_message(chat_id, "❌ No active voice chat. Start a voice chat in this group and try again.")
+            name = type(ex).__name__
+            if "NoActiveGroupCall" in name or "GroupCallNotFound" in name:
+                await say(chat_id, "❌ No active voice chat. Start a voice chat in this group and try again.")
                 break
-            name = song.get("title") or song.get("page") or "song"
-            await bot.send_message(chat_id, f"⚠️ Couldn't play '{name}', skipping.")
-            q.pop(0)
+            if any(k in name for k in ("UserNotParticipant", "ChatForbidden", "ChannelPrivate")):
+                _joined.discard(chat_id)  # assistant was removed, re-join next time
+            title = song.get("title") or song.get("page") or "song"
+            reason = f" ({ex})" if isinstance(ex, media.MediaError) else ""
+            await say(chat_id, f"⚠️ Couldn't play '{title}'{reason}, skipping.")
+            if q and q[0] is song:
+                q.pop(0)
+            if not q and _refill_radio(chat_id, q):
+                pass  # radio never runs dry because of a bad song
             fails += 1
-            if fails >= 3:  # spam se bachne ke liye
-                await bot.send_message(chat_id, "⚠️ Too many errors in a row, stopping.")
+            if fails >= 3:  # avoid spam
+                await say(chat_id, "⚠️ Too many errors in a row, stopping.")
                 break
-    await stop_all(chat_id)
+            continue
+        # ---- playing: the "Now playing" message is separate, its failure must not skip the song
+        song["started"] = time.time()
+        song.pop("paused_at", None)
+        song.pop("wd", None)
+        if announce:
+            await say(chat_id, now_playing_text(song), parse_mode=ParseMode.HTML,
+                      disable_web_page_preview=True, reply_markup=buttons(chat_id),
+                      reply_to_message_id=song.get("msg_id"))  # reply to the /play message
+        spawn(_prefetch(q))
+        return
+    if queues.get(chat_id) is q:
+        await stop_all(chat_id)
+
+
+async def _play_safe(chat_id: int, announce: bool = True):
+    """_play_locked that can never leave the queue stuck because of an unexpected exception."""
+    try:
+        await _play_locked(chat_id, announce)
+    except Exception as ex:
+        log.exception("player crashed in %s", chat_id)
+        db.log_error(chat_id, "Player crashed", ex)
+        await say(chat_id, "⚠️ Player error. Stopped, please /play again.")
+        await stop_all(chat_id)
+
+
+async def play_next(chat_id: int, announce: bool = True, status: Message | None = None):
+    try:
+        async with _locks[chat_id]:
+            await _play_safe(chat_id, announce)
+    finally:
+        if status:
+            try:
+                await status.delete()
+            except Exception:
+                pass
 
 
 async def stop_all(chat_id: int):
     queues.pop(chat_id, None)
     loops.pop(chat_id, None)
+    radio_src.pop(chat_id, None)
     try:
-        await call.leave_call(chat_id)
+        await call_for(chat_id).leave_call(chat_id)
     except Exception:
         pass
 
 
-@call.on_update()
+async def _on_stream_end(chat_id: int, expect: dict | None = None):
+    async with _locks[chat_id]:
+        q = queues.get(chat_id)
+        if not q:
+            return
+        if expect is not None and q[0] is not expect:  # watchdog: song already changed
+            return
+        if loops.get(chat_id):
+            await _play_safe(chat_id, announce=False)
+            return
+        q.pop(0)
+        if q:
+            await _play_safe(chat_id)
+        else:
+            was_radio = chat_id in radio_src
+            await stop_all(chat_id)
+            await say(chat_id, "📻 Radio finished. Left the voice chat." if was_radio
+                      else "✅ Queue finished. Left the voice chat.")
+
+
+async def watchdog_loop():
+    """If Telegram never tells us a stream ended (lost event), move on after duration + grace."""
+    while True:
+        await asyncio.sleep(30)
+        now = time.time()
+        for chat_id, q in list(queues.items()):
+            try:
+                if not q:
+                    continue
+                s = q[0]
+                st, dur = s.get("started"), s.get("duration")
+                if not st or not dur or s.get("paused_at") or s.get("wd"):
+                    continue
+                if now - st > dur + STALL_GRACE:
+                    s["wd"] = True
+                    log.warning("watchdog: stream stalled in %s, advancing", chat_id)
+                    spawn(_on_stream_end(chat_id, expect=s))
+            except Exception as ex:
+                log.warning("watchdog error: %s", ex)
+
+
 async def on_update(_, update):
-    # Sirf "gaana khatam" wale update par kaam karo (StreamEnded / StreamAudioEnded)
-    names = {c.__name__ for c in type(update).__mro__}
-    if not names & {"StreamEnded", "StreamAudioEnded"}:
-        return
-    chat_id = update.chat_id
-    q = queues.get(chat_id)
-    if not q:
-        return
-    if loops.get(chat_id):
-        await play_next(chat_id, announce=False)
-        return
-    q.pop(0)
-    if q:
-        await play_next(chat_id)
-    else:
-        await stop_all(chat_id)
-        await bot.send_message(chat_id, "✅ Queue finished. Left the voice chat.")
-
-
-async def is_admin(chat_id: int, user_id: int) -> bool:
     try:
-        m = await bot.get_chat_member(chat_id, user_id)
-        return m.status in (ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER)
-    except Exception:
-        return False
+        names = {c.__name__ for c in type(update).__mro__}
+        if names & {"StreamEnded", "StreamAudioEnded"}:
+            await _on_stream_end(update.chat_id)
+        elif "ChatUpdate" in names:
+            # bot kicked / voice chat closed: drop the queue so no stale state is left
+            status = str(getattr(update, "status", ""))
+            if any(k in status for k in ("KICKED", "LEFT_GROUP", "CLOSED_VOICE_CHAT", "DISCARDED_CALL")):
+                queues.pop(update.chat_id, None)
+                loops.pop(update.chat_id, None)
+                radio_src.pop(update.chat_id, None)
+                _joined.discard(update.chat_id)
+    except Exception as ex:
+        log.exception("on_update failed: %s", ex)
+        db.log_error(getattr(update, "chat_id", None), "on_update failed", ex)
+
+
+for _a in ASSISTANTS:
+    _a.call.on_update()(on_update)
 
 
 # ---------------- Group add / leave tracking (admin panel) ----------------
@@ -274,7 +466,7 @@ async def track_member(_, u: ChatMemberUpdated):
         elif new.status in ACTIVE_STATUS:
             db.mark_added(u.chat.id, u.chat.title)
     except Exception as ex:
-        print("track error:", ex)
+        log.warning("track error: %s", ex)
 
 
 @bot.on_message(filters.group & (filters.new_chat_members | filters.left_chat_member), group=6)
@@ -286,17 +478,70 @@ async def track_service(_, m: Message):
         elif m.left_chat_member and m.left_chat_member.id == BOT_ID:
             db.mark_left(m.chat.id, m.chat.title)
     except Exception as ex:
-        print("track error:", ex)
+        log.warning("track error: %s", ex)
 
 
 # ---------------- Commands ----------------
+START_PHOTO = os.environ.get("START_PHOTO", "")  # URL / file_id; else assets/start.jpg is used
+SUPPORT_URL = os.environ.get("SUPPORT_URL", "")  # e.g. https://t.me/YourSupportGroup
+START_TEXT = (
+    "🎧 <b>Powerful music bot, never falls!</b>\n\n"
+    "Lag-free, high quality songs in your group voice chat.\n"
+    "Add me to your group, make me admin and enjoy the music.\n\n"
+    "<b>Tap Commands to see everything I can do.</b>"
+)
+HELP_TEXT = (
+    "<b>Commands</b>\n\n"
+    "/play <i>song name or link</i> - play a song\n"
+    "/pause - pause\n/resume - resume\n/skip - next song\n"
+    "/stop - stop and leave\n/queue - show queue\n/loop - loop on/off\n"
+    "/radio - radio (admins only)"
+)
+
+
+def start_kb(back: bool = False) -> InlineKeyboardMarkup:
+    if back:
+        return InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Back", callback_data="home")]])
+    rows = [[InlineKeyboardButton(
+        "➕ Add me to your group",
+        url=f"https://t.me/{BOT_USERNAME}?startgroup=true&admin=manage_video_chats+delete_messages+invite_users")]]
+    row2 = [InlineKeyboardButton("📖 Commands", callback_data="cmds")]
+    if SUPPORT_URL:
+        row2.append(InlineKeyboardButton("💬 Support", url=SUPPORT_URL))
+    rows.append(row2)
+    return InlineKeyboardMarkup(rows)
+
+
+def _start_photo():
+    if START_PHOTO:
+        return START_PHOTO
+    p = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", "start.jpg")
+    return p if os.path.exists(p) else None
+
+
 async def _start_help(m: Message):
-    await m.reply_text(
-        "🎧 Add me to your group, make me admin, start a voice chat and send:\n"
-        "/play song name or link\n"
-        "/radio (admins only)\n\n"
-        "/pause /resume /skip /stop /queue /loop"
-    )
+    photo = _start_photo()
+    if photo:
+        try:
+            return await m.reply_photo(photo, caption=START_TEXT, parse_mode=ParseMode.HTML,
+                                       reply_markup=start_kb())
+        except Exception as ex:
+            log.warning("start photo failed: %s", ex)
+    await m.reply_text(START_TEXT, parse_mode=ParseMode.HTML, reply_markup=start_kb())
+
+
+@bot.on_callback_query(filters.regex(r"^(cmds|home)$"))
+async def start_cb(_, c: CallbackQuery):
+    back = c.data == "cmds"
+    text = HELP_TEXT if back else START_TEXT
+    try:
+        if c.message.photo:
+            await c.message.edit_caption(text, parse_mode=ParseMode.HTML, reply_markup=start_kb(back))
+        else:
+            await c.message.edit_text(text, parse_mode=ParseMode.HTML, reply_markup=start_kb(back))
+    except Exception:
+        pass
+    await c.answer()
 
 
 @bot.on_message(filters.command("start") & filters.private)
@@ -315,6 +560,22 @@ async def play(_, m: Message):
         return await m.reply_text("Usage: /play song name or link")
     if "spotify.com" in query:
         return await m.reply_text("Spotify links aren't supported. Send the song name instead.")
+    query = query[:200]
+    is_link = bool(re.match(r"https?://", query))
+    link = media.clean_url(query) if is_link else None
+    if is_link and not link:
+        return await m.reply_text("❌ Only YouTube and SoundCloud links (single songs) are supported.")
+
+    uid = m.from_user.id if m.from_user else None
+    if uid is not None:  # anti-spam cooldown per user
+        now = time.time()
+        if now - _last_play.get(uid, 0) < PLAY_COOLDOWN:
+            return await m.reply_text("⏳ Please wait a few seconds before the next /play.")
+        _last_play[uid] = now
+        if len(_last_play) > 5000:
+            _last_play.clear()
+    if len(queues.get(m.chat.id, [])) >= MAX_QUEUE:
+        return await m.reply_text(f"❌ Queue is full ({MAX_QUEUE} songs). Wait for some songs to finish.")
 
     db.seen(m.chat.id, m.chat.title)
     status = await m.reply_text("🔎 Searching...")
@@ -322,32 +583,55 @@ async def play(_, m: Message):
         await ensure_assistant(m.chat.id)
     except Exception as ex:
         db.log_error(m.chat.id, "Assistant could not join", ex)
-        return await status.edit_text(
-            "❌ Make me admin (with 'Invite users' permission) and start a voice chat first."
-        )
+        return await status.edit_text(join_error_text(ex, m.chat.id))
 
     by = m.from_user.first_name if m.from_user else "Unknown"
-    if re.match(r"https?://", query):  # direct link (YouTube, SoundCloud etc.)
-        song = {"title": None, "page": query, "query": None, "by": by}
+    if link:  # direct link (YouTube, SoundCloud)
+        song = {"title": None, "page": link, "query": None, "by": by, "msg_id": m.id}
     else:
-        found = await run(_search_sync, query)
+        try:
+            found = await media.search(query)
+        except Exception as ex:
+            db.log_error(m.chat.id, "Search failed", ex)
+            found = None
         if not found:
             return await status.edit_text("❌ Song not found.")
-        song = {"title": found["title"], "page": found["page"], "query": query, "by": by}
+        song = {"title": found["title"], "page": found["page"], "query": query, "by": by,
+                "msg_id": m.id, "duration": found.get("duration")}
 
     q = queues.setdefault(m.chat.id, [])
     q.append(song)
     if len(q) == 1:
-        await status.delete()
-        await play_next(m.chat.id)
+        await status.edit_text("⬇️ Preparing audio...")
+        await play_next(m.chat.id, status=status)
     else:
         await status.edit_text(f"➕ Added to queue #{len(q) - 1}: {song['title'] or 'link'}")
+        if len(q) == 2:
+            spawn(_prefetch(q))
+
+
+async def do_pause(chat_id: int):
+    await call_for(chat_id).pause(chat_id)
+    q = queues.get(chat_id)
+    if q and not q[0].get("paused_at"):
+        q[0]["paused_at"] = time.time()
+
+
+async def do_resume(chat_id: int):
+    await call_for(chat_id).resume(chat_id)
+    q = queues.get(chat_id)
+    if q:
+        p = q[0].pop("paused_at", None)
+        if p and q[0].get("started"):
+            q[0]["started"] += time.time() - p  # pause time does not count for the watchdog
 
 
 @bot.on_message(filters.command("pause") & filters.group)
 async def pause(_, m: Message):
+    if await _deny(m):
+        return
     try:
-        await call.pause(m.chat.id)
+        await do_pause(m.chat.id)
         await m.reply_text("⏸ Paused")
     except Exception:
         await m.reply_text("Nothing is playing.")
@@ -355,39 +639,50 @@ async def pause(_, m: Message):
 
 @bot.on_message(filters.command("resume") & filters.group)
 async def resume(_, m: Message):
+    if await _deny(m):
+        return
     try:
-        await call.resume(m.chat.id)
+        await do_resume(m.chat.id)
         await m.reply_text("▶️ Resumed")
     except Exception:
         await m.reply_text("Nothing is playing.")
 
 
 async def do_skip(chat_id: int) -> str:
-    q = queues.get(chat_id)
-    if not q:
-        return "Nothing is playing."
-    q.pop(0)
-    loops[chat_id] = False
-    if q:
-        await play_next(chat_id)
-        return "⏭ Skipped"
-    await stop_all(chat_id)
-    return "⏭ Skipped. Queue is empty, left the voice chat."
+    async with _locks[chat_id]:
+        q = queues.get(chat_id)
+        if not q:
+            return "Nothing is playing."
+        q.pop(0)
+        loops[chat_id] = False
+        if not q:
+            _refill_radio(chat_id, q)
+        if q:
+            await _play_safe(chat_id)
+            return "⏭ Skipped"
+        await stop_all(chat_id)
+        return "⏭ Skipped. Queue is empty, left the voice chat."
 
 
 @bot.on_message(filters.command("skip") & filters.group)
 async def skip(_, m: Message):
+    if await _deny(m):
+        return
     await m.reply_text(await do_skip(m.chat.id))
 
 
 @bot.on_message(filters.command("stop") & filters.group)
 async def stop(_, m: Message):
+    if await _deny(m):
+        return
     await stop_all(m.chat.id)
     await m.reply_text("⏹ Stopped.")
 
 
 @bot.on_message(filters.command("loop") & filters.group)
 async def loop_cmd(_, m: Message):
+    if await _deny(m):
+        return
     if not queues.get(m.chat.id):
         return await m.reply_text("Nothing is playing.")
     loops[m.chat.id] = not loops.get(m.chat.id, False)
@@ -410,7 +705,8 @@ async def queue_cmd(_, m: Message):
 
 # ---------------- Radio ----------------
 # Flow: group me admin /radio -> bot "Open radio menu" button deta hai -> admin ke private chat me
-# language -> singer choose -> 10 songs group ke VC me bajte hain.
+# language -> singer choose -> gaane group ke VC me bajte hain (khatam hone par apne aap naye aate hain,
+# /stop tak radio chalta rehta hai).
 @bot.on_message(filters.command("radio") & filters.group)
 async def radio_cmd(_, m: Message):
     db.seen(m.chat.id, m.chat.title)
@@ -473,6 +769,9 @@ async def radio_menu(m: Message):
     if not await is_admin(chat_id, m.from_user.id):
         return await m.reply_text("📻 Only admins of that group can use radio.")
     dm_state[m.from_user.id] = {"chat": chat_id, "lang": None}
+    if len(dm_state) > 5000:
+        dm_state.clear()
+        dm_state[m.from_user.id] = {"chat": chat_id, "lang": None}
     await m.reply_text("📻 Radio\n\nChoose a language:", reply_markup=lang_kb())
 
 
@@ -487,14 +786,12 @@ async def start_radio(user_id: int, songs: list[tuple], label: str) -> str:
         await ensure_assistant(chat_id)
     except Exception as ex:
         db.log_error(chat_id, "Assistant could not join (radio)", ex)
-        return "Make the bot admin (Invite users permission) and start a voice chat in the group first."
-    picked = random.sample(songs, min(RADIO_COUNT, len(songs)))
-    queues[chat_id] = [
-        {"title": f"{t} - {a}", "page": None, "query": f"{t} {a}", "by": "📻 Radio"}
-        for t, a in picked
-    ]
-    loops.pop(chat_id, None)
-    await bot.send_message(chat_id, f"📻 Radio started: {label}")
+        return join_error_text(ex, chat_id)
+    async with _locks[chat_id]:
+        queues[chat_id] = _radio_items(songs)
+        radio_src[chat_id] = (songs, label)
+        loops.pop(chat_id, None)
+    await say(chat_id, f"📻 Radio started: {label}\nSend /stop to end it.")
     await play_next(chat_id)
     return f"✅ Radio started in the group: {label}"
 
@@ -530,14 +827,14 @@ async def radio_cb(_, c: CallbackQuery):
             msg = await start_radio(uid, LANG_ALL[lang], f"{lang} mix")
             await c.message.edit_text(msg)
     except Exception as ex:
-        print("radio cb error:", ex)
+        log.warning("radio cb error: %s", ex)
         db.log_error(dm_state.get(uid, {}).get("chat"), "Radio menu error", ex)
         await c.answer("Something went wrong, try again.", show_alert=True)
 
 
-@bot.on_message(filters.private & filters.text & ~filters.command(["start", "play", "radio"]))
+@bot.on_message(filters.private & filters.text & ~filters.regex(r"^/"))
 async def radio_typed(_, m: Message):
-    st = dm_state.get(m.from_user.id)
+    st = dm_state.get(m.from_user.id) if m.from_user else None
     if not st or not st.get("lang"):
         return
     lang = st["lang"]
@@ -553,12 +850,14 @@ async def radio_typed(_, m: Message):
 async def cb(_, c: CallbackQuery):
     chat_id = c.message.chat.id
     d = c.data
+    if not await can_control(chat_id, c.from_user):
+        return await c.answer("Only admins can do this.", show_alert=True)
     try:
         if d == "pause":
-            await call.pause(chat_id)
+            await do_pause(chat_id)
             await c.answer("Paused")
         elif d == "resume":
-            await call.resume(chat_id)
+            await do_resume(chat_id)
             await c.answer("Resumed")
         elif d == "skip":
             await c.answer(await do_skip(chat_id))
@@ -582,14 +881,14 @@ async def do_broadcast(text: str, st: dict):
     ids = db.active_group_ids()
     st["total"] = len(ids)
     for cid in ids:
-        for attempt in range(2):
+        for attempt in range(3):
             try:
                 await bot.send_message(cid, text)
                 st["sent"] += 1
                 break
             except Exception as ex:
                 name = type(ex).__name__
-                if name == "FloodWait" and attempt == 0:
+                if name == "FloodWait" and attempt < 2:
                     await asyncio.sleep(getattr(ex, "value", 30) + 1)
                     continue
                 st["failed"] += 1
@@ -603,13 +902,26 @@ async def do_broadcast(text: str, st: dict):
 
 
 # ---------------- Run ----------------
+async def notify_shutdown():
+    """Redeploy / SIGTERM: tell groups that are playing, so nobody is left wondering."""
+    chats = list(queues)
+    if not chats:
+        return
+    msg = "🔄 Bot is restarting for an update. Queue was cleared, please /play again in a minute."
+    try:
+        await asyncio.wait_for(asyncio.gather(*(say(c, msg) for c in chats)), timeout=8)
+    except Exception:
+        pass
+
+
 async def main():
     global BOT_USERNAME, BOT_ID
     await bot.start()
     me = await bot.get_me()
     BOT_USERNAME, BOT_ID = me.username, me.id
-    await assistant.start()
-    await call.start()
+    for a in ASSISTANTS:
+        await a.client.start()
+        await a.call.start()
     panel.library = {
         "total_songs": sum(len(v) for v in LANG_ALL.values()),
         "total_singers": sum(len(v) for v in ARTISTS.values()),
@@ -617,9 +929,13 @@ async def main():
     }
     panel.broadcast_fn = do_broadcast
     await panel.start()
-    asyncio.create_task(panel.cleanup_loop())
-    print(f"Bot is running as @{BOT_USERNAME} | radio languages: {LANGS}")
+    spawn(panel.cleanup_loop())
+    spawn(media.evict_loop())
+    spawn(watchdog_loop())
+    log.info("Bot is running as @%s | assistants: %s | radio languages: %s",
+             BOT_USERNAME, [a.tag for a in ASSISTANTS], LANGS)
     await idle()
+    await notify_shutdown()
 
 
 if __name__ == "__main__":
