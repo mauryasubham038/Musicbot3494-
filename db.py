@@ -38,12 +38,20 @@ CREATE TABLE IF NOT EXISTS errors (
 CREATE TABLE IF NOT EXISTS searches (
     key TEXT PRIMARY KEY, title TEXT, page TEXT NOT NULL, duration INTEGER, ts REAL NOT NULL
 );
+CREATE TABLE IF NOT EXISTS tgcache (
+    key TEXT PRIMARY KEY, file_id TEXT NOT NULL, title TEXT, duration INTEGER,
+    page TEXT, ext TEXT, ts REAL NOT NULL, hits INTEGER NOT NULL DEFAULT 0
+);
 CREATE INDEX IF NOT EXISTS ix_events_ts ON events(ts);
 CREATE INDEX IF NOT EXISTS ix_errors_ts ON errors(ts);
 """)
+try:  # older databases (before error codes) get the new column
+    con.execute("ALTER TABLE errors ADD COLUMN detail TEXT")
+except sqlite3.OperationalError:
+    pass
 con.commit()
 
-_ANSI = re.compile(r"\x1b\[[0-9;]*m")
+_ANSI =re.compile(r"\x1b\[[0-9;]*m")
 _VIDEO_ID = re.compile(r"(\[[^\]]+\]) [\w-]{6,}:")
 
 
@@ -108,12 +116,22 @@ def active_group_ids() -> list[int]:
 
 # ---------- errors ----------
 @_locked
-def log_error(chat_id: int | None, where: str, ex: Exception | None = None):
-    msg = where if ex is None else f"{where}: {type(ex).__name__}: {ex}"
+def log_error(chat_id: int | None, where: str, ex: Exception | None = None,
+              code: str | None = None, hint: str | None = None, detail: str | None = None):
+    """With `code`: msg = '[CODE] where -> what to do' (stable, so equal causes are counted together)
+    and the raw technical text goes to `detail`. Without code: old behaviour."""
+    if code:
+        msg = f"[{code}] {where}" + (f" -> {hint}" if hint else "")
+        detail = detail or (f"{type(ex).__name__}: {ex}" if ex is not None else None)
+    else:
+        msg = where if ex is None else f"{where}: {type(ex).__name__}: {ex}"
     msg = _ANSI.sub("", msg).replace("ERROR: ", "").strip()
-    msg = _VIDEO_ID.sub(r"\1:", msg)[:300]  # video id hatao, taaki same error ek hi row me gine
-    print("[error]", chat_id, msg)
-    con.execute("INSERT INTO errors(ts,chat_id,msg) VALUES(?,?,?)", (time.time(), chat_id, msg))
+    msg = _VIDEO_ID.sub(r"\1:", msg)[:400]  # video id hatao, taaki same error ek hi row me gine
+    if detail:
+        detail = _ANSI.sub("", detail).replace("ERROR: ", "").strip()[:600]
+    print("[error]", chat_id, msg, "|", detail or "")
+    con.execute("INSERT INTO errors(ts,chat_id,msg,detail) VALUES(?,?,?,?)",
+                (time.time(), chat_id, msg, detail))
     con.commit()
 
 
@@ -137,6 +155,35 @@ def search_put(key: str, res: dict):
     con.execute("INSERT OR REPLACE INTO searches(key,title,page,duration,ts) VALUES(?,?,?,?,?)",
                 (key, res.get("title"), res["page"], res.get("duration"), time.time()))
     con.commit()
+
+
+# ---------- songs stored in the Telegram storage channel (used by main.py) ----------
+@_locked
+def tgcache_get(key: str) -> dict | None:
+    row = _q("SELECT file_id, title, duration, page, ext FROM tgcache WHERE key=?", key)
+    if not row:
+        return None
+    con.execute("UPDATE tgcache SET hits=hits+1 WHERE key=?", (key,))
+    con.commit()
+    r = row[0]
+    return {"file_id": r[0], "title": r[1], "duration": r[2], "page": r[3], "ext": r[4] or ".m4a"}
+
+
+@_locked
+def tgcache_put(key: str, file_id: str, title: str | None, duration, page: str | None, ext: str):
+    con.execute("INSERT OR REPLACE INTO tgcache(key,file_id,title,duration,page,ext,ts) "
+                "VALUES(?,?,?,?,?,?,?)", (key, file_id, title, duration, page, ext, time.time()))
+    con.commit()
+
+
+@_locked
+def tgcache_delete(key: str):
+    con.execute("DELETE FROM tgcache WHERE key=?", (key,))
+    con.commit()
+
+
+def tgcache_count() -> int:
+    return _q("SELECT COUNT(*) FROM tgcache")[0][0]
 
 
 # ---------- stats for panel ----------
@@ -185,13 +232,14 @@ def stats(tzname: str = "Asia/Kolkata") -> dict:
         "SELECT COUNT(*), COUNT(DISTINCT chat_id) FROM errors WHERE ts>=?", cutoff)[0]
     grouped = [
         {"msg": r[0], "count": r[1], "groups": r[2], "last": fmt(r[3])}
-        for r in _q("SELECT substr(msg,1,150), COUNT(*), COUNT(DISTINCT chat_id), MAX(ts) "
-                    "FROM errors WHERE ts>=? GROUP BY substr(msg,1,150) "
+        for r in _q("SELECT substr(msg,1,400), COUNT(*), COUNT(DISTINCT chat_id), MAX(ts) "
+                    "FROM errors WHERE ts>=? GROUP BY substr(msg,1,400) "
                     "ORDER BY COUNT(*) DESC LIMIT 20", cutoff)
     ]
     recent_err = [
-        {"time": fmt(r[0]), "group": r[1] or (str(r[2]) if r[2] else "-"), "msg": r[3]}
-        for r in _q("SELECT e.ts, g.title, e.chat_id, e.msg FROM errors e "
+        {"time": fmt(r[0]), "group": r[1] or (str(r[2]) if r[2] else "-"), "msg": r[3],
+         "detail": r[4] or ""}
+        for r in _q("SELECT e.ts, g.title, e.chat_id, e.msg, e.detail FROM errors e "
                     "LEFT JOIN groups g ON g.chat_id=e.chat_id "
                     "WHERE e.ts>=? ORDER BY e.ts DESC LIMIT 50", cutoff)
     ]

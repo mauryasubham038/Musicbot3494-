@@ -173,7 +173,9 @@ def _cookie_blocked(c: Cookie, ex: Exception):
         state = "DEAD (invalid)" if c.dead else f"blocked for {COOKIE_COOLDOWN // 60} min"
     log.warning("cookie %s %s: %s", c.name, state, msg)
     try:
-        db.log_error(None, f"Cookie '{c.name}' {state}: {msg}")
+        db.log_error(None, f"Cookie '{c.name}' {state}", None, code="YT_COOKIE",
+                     hint="YouTube refused this cookie: add more cookies / a proxy, or re-export it "
+                          "from a fresh browser session", detail=msg)
     except Exception:
         pass
 

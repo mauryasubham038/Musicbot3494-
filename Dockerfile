@@ -15,7 +15,7 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY main.py media.py db.py panel.py songs.csv ./
+COPY main.py media.py db.py panel.py errors.py songs.csv ./
 COPY assets ./assets
 
 # Har restart par yt-dlp update (YouTube roz badalta hai). Update fail ho to bhi bot start hoga.

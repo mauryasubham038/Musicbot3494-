@@ -6,6 +6,7 @@ except RuntimeError:
     asyncio.set_event_loop(asyncio.new_event_loop())
 
 import csv
+import hashlib
 import html
 import logging
 import os
@@ -13,6 +14,7 @@ import random
 import re
 import time
 from collections import defaultdict
+from datetime import datetime, timedelta
 
 from dotenv import load_dotenv
 from pyrogram import Client, filters, idle
@@ -31,6 +33,7 @@ from rapidfuzz import fuzz, process
 import db
 import media
 import panel
+from errors import diagnose
 
 load_dotenv()
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -163,6 +166,24 @@ async def say(chat_id: int, text: str, **kw):
         return None
 
 
+def report(chat_id: int | None, where: str, ex: Exception, song: dict | None = None):
+    """Single place where every error is classified, logged (Railway logs + admin panel) and
+    returned as a Diag (code / user text / fix hint). Unknown errors also get a full traceback."""
+    d = diagnose(ex)
+    if d.code == "IGNORE_NOT_MODIFIED":
+        return d
+    detail = f"{type(ex).__name__}: {ex}"
+    if song:
+        detail += f" | song={song.get('title') or song.get('query') or song.get('page')}"
+    log.warning("[%s] %s | chat=%s | %s | FIX: %s", d.code, where, chat_id, detail, d.hint,
+                exc_info=ex if d.code == "UNKNOWN" else None)
+    try:
+        db.log_error(chat_id, where, ex, code=d.code, hint=d.hint, detail=detail)
+    except Exception:
+        pass
+    return d
+
+
 def buttons(chat_id: int) -> InlineKeyboardMarkup:
     lp = "🔂 Loop ON" if loops.get(chat_id) else "🔁 Loop"
     return InlineKeyboardMarkup([[
@@ -231,34 +252,172 @@ async def _deny(m: Message) -> bool:
     return True
 
 
+async def _assistant_is_member(a: Assistant, chat_id: int) -> bool:
+    """Is the assistant already in the group? Asked twice: by the assistant itself and, if that
+    fails (assistant has no cached info about the group after a restart), by the bot."""
+    try:
+        m = await a.client.get_chat_member(chat_id, "me")
+        return m.status not in (ChatMemberStatus.LEFT, ChatMemberStatus.BANNED)
+    except Exception:
+        pass
+    try:
+        me = a.client.me or await a.client.get_me()
+        m = await bot.get_chat_member(chat_id, me.id)
+        return m.status not in (ChatMemberStatus.LEFT, ChatMemberStatus.BANNED)
+    except Exception:
+        return False
+
+
+async def _fresh_link(chat_id: int) -> str:
+    """A NEW temporary invite link. export_chat_invite_link() revokes the group's main link every
+    time, which breaks links in use (and caused INVITE_HASH_EXPIRED when joins overlapped)."""
+    try:
+        l = await bot.create_chat_invite_link(chat_id, name="assistant",
+                                              expire_date=datetime.now() + timedelta(minutes=10))
+        return l.invite_link
+    except Exception:
+        return await bot.export_chat_invite_link(chat_id)
+
+
+async def _join(a: Assistant, chat_id: int):
+    def already(ex: Exception) -> bool:
+        return type(ex).__name__ == "UserAlreadyParticipant"
+
+    try:  # public group: join by @username, no invite link needed
+        chat = await bot.get_chat(chat_id)
+        if getattr(chat, "username", None):
+            try:
+                await a.client.join_chat(chat.username)
+                return
+            except Exception as ex:
+                if already(ex):
+                    return
+    except Exception:
+        pass
+    last: Exception | None = None
+    for _ in range(2):  # expired link -> ask for a fresh one once
+        link = await _fresh_link(chat_id)
+        try:
+            await a.client.join_chat(link)
+            return
+        except Exception as ex:
+            if already(ex):
+                return
+            if type(ex).__name__ not in ("InviteHashExpired", "InviteHashInvalid"):
+                raise
+            last = ex
+            await asyncio.sleep(1)
+    if await _assistant_is_member(a, chat_id):  # link is dead because assistant is already inside
+        return
+    raise last  # type: ignore[misc]
+
+
 async def ensure_assistant(chat_id: int):
     if chat_id in _joined:
         return
     a = assistant_for(chat_id)
-    try:
-        await a.client.get_chat_member(chat_id, "me")
-    except Exception:
+    if not await _assistant_is_member(a, chat_id):
         async with a.join_lock:
-            link = await bot.export_chat_invite_link(chat_id)
-            try:
-                await a.client.join_chat(link)
-            except Exception as ex:
-                if type(ex).__name__ != "UserAlreadyParticipant":
-                    raise
+            await _join(a, chat_id)
             await asyncio.sleep(1.5)  # space out joins of one account (FloodWait protection)
     _joined.add(chat_id)
 
 
 def join_error_text(ex: Exception, chat_id: int) -> str:
-    n = type(ex).__name__
+    d = diagnose(ex)
     tag = assistant_for(chat_id).tag
-    if "Banned" in n or n == "UserKicked":
-        return f"❌ The assistant {tag} is banned in this group. Unban it and try again."
-    if n == "InviteRequestSent":
-        return f"⏳ Approve the join request of {tag}, then try again."
-    if n == "FloodWait":
-        return "⏳ Telegram is limiting joins right now. Try again in a minute."
-    return "❌ Make me admin (with 'Invite users' permission) and start a voice chat first."
+    if d.code == "UNKNOWN":
+        return ("❌ I could not bring my assistant into this group. Make me admin (with 'Invite "
+                f"users' permission), or add {tag} manually, and try again. [JOIN_FAILED]")
+    return f"❌ {d.user} (assistant: {tag}) [{d.code}]"
+
+
+# ---------------- Song storage in a Telegram channel ----------------
+# STORAGE_CHANNEL = id of a private channel where the bot is admin (e.g. -1001234567890).
+# (RADIO songs only.) First time a song is played it is downloaded from YouTube, played, and uploaded to the channel
+# (its file_id is saved in SQLite). Next time ANY group asks for the same song it is downloaded
+# from Telegram (fast, no YouTube request, no cookie use). If anything fails -> YouTube is used.
+STORAGE_CHANNEL = int(os.environ.get("STORAGE_CHANNEL", "0") or 0)
+_uploading: set[str] = set()
+_upload_sem = asyncio.Semaphore(2)
+
+
+def _cache_key(song: dict) -> str | None:
+    if not song.get("radio"):  # only RADIO songs use the storage channel, /play never does
+        return None
+    if song.get("query"):
+        return "q:" + " ".join(song["query"].lower().split())
+    if song.get("page"):
+        return "u:" + song["page"]
+    return None
+
+
+async def _from_telegram(key: str, row: dict) -> str:
+    name = "tg-" + hashlib.sha1(key.encode()).hexdigest()[:16] + row["ext"]
+    path = os.path.join(media.DL_DIR, name)
+    if os.path.exists(path) and os.path.getsize(path) > 0:
+        media._last_used[path] = time.time()
+        return path
+
+    async def job():
+        tmp = path + ".part"
+        got = await bot.download_media(row["file_id"], file_name=tmp)
+        if not got or not os.path.exists(got) or os.path.getsize(got) == 0:
+            raise RuntimeError("empty download from storage channel")
+        os.replace(got, path)
+        return path
+
+    res = await media._dedupe(("t", key), job)
+    media._last_used[res] = time.time()
+    return res
+
+
+async def _upload_to_channel(key: str, path: str, title: str | None, dur, page: str | None):
+    if key in _uploading:
+        return
+    _uploading.add(key)
+    try:
+        if await asyncio.to_thread(db.tgcache_get, key):
+            return
+        async with _upload_sem:
+            m = await bot.send_audio(STORAGE_CHANNEL, path, title=(title or "")[:60],
+                                     duration=int(dur or 0), caption=f"{key}\n{page or ''}"[:900])
+        media_obj = m.audio or m.document
+        if not media_obj:
+            return
+        await asyncio.to_thread(db.tgcache_put, key, media_obj.file_id, title, dur, page,
+                                os.path.splitext(path)[1] or ".m4a")
+        log.info("stored in channel: %s", key)
+    except Exception as ex:
+        report(None, "Storage upload failed", ex)
+    finally:
+        _uploading.discard(key)
+
+
+async def get_audio(song: dict) -> tuple[str, str, int | None]:
+    """(local file, title, duration): Telegram storage first, YouTube/SoundCloud otherwise."""
+    key = _cache_key(song)
+    if STORAGE_CHANNEL and key:
+        row = await asyncio.to_thread(db.tgcache_get, key)
+        if row:
+            try:
+                path = await _from_telegram(key, row)
+                if row.get("page") and not song.get("page"):
+                    song["page"] = row["page"]  # keeps the clickable title
+                return path, row["title"] or song.get("title") or "song", row["duration"]
+            except Exception as ex:
+                log.warning("storage download failed (%s): %s %s", key, type(ex).__name__, ex)
+                await asyncio.to_thread(db.tgcache_delete, key)  # stale file_id -> re-store below
+    if not song.get("page"):
+        found = await media.search(song["query"])
+        if not found:
+            raise media.MediaError("Song not found.")
+        song["page"] = found["page"]
+        song["duration"] = song.get("duration") or found.get("duration")
+    path, title, dur = await media.fetch(song["page"])
+    if STORAGE_CHANNEL and key:
+        spawn(_upload_to_channel(key, path, title, dur or song.get("duration"), song["page"]))
+    return path, title, dur
 
 
 async def _prefetch(q: list):
@@ -267,13 +426,7 @@ async def _prefetch(q: list):
         return
     nxt = q[1]
     try:
-        if not nxt.get("page"):
-            found = await media.search(nxt["query"])
-            if not found:
-                return
-            nxt["page"] = found["page"]
-            nxt["duration"] = nxt.get("duration") or found.get("duration")
-        path, _t, dur = await media.fetch(nxt["page"])
+        path, _t, dur = await get_audio(nxt)
         nxt["file"] = path
         nxt["duration"] = nxt.get("duration") or dur
     except Exception as ex:
@@ -282,7 +435,7 @@ async def _prefetch(q: list):
 
 def _radio_items(songs: list[tuple]) -> list[dict]:
     picked = random.sample(songs, min(RADIO_COUNT, len(songs)))
-    return [{"title": f"{t} - {a}", "page": None, "query": f"{t} {a}", "by": "📻 Radio"}
+    return [{"title": f"{t} - {a}", "page": None, "query": f"{t} {a}", "by": "📻 Radio", "radio": True}
             for t, a in picked]
 
 
@@ -301,13 +454,7 @@ async def _play_locked(chat_id: int, announce: bool = True):
         song = q[0]
         try:
             # Search + download only right before playing (cache + dedupe live in media.py)
-            if not song.get("page"):
-                found = await media.search(song["query"])
-                if not found:
-                    raise media.MediaError("Song not found.")
-                song["page"] = found["page"]
-                song["duration"] = song.get("duration") or found.get("duration")
-            path, real_title, dur = await media.fetch(song["page"])
+            path, real_title, dur = await get_audio(song)
             song["file"] = path
             song["title"] = song.get("title") or real_title
             song["duration"] = dur or song.get("duration")
@@ -317,17 +464,18 @@ async def _play_locked(chat_id: int, announce: bool = True):
                 chat_id, MediaStream(path, audio_parameters=AudioQuality.HIGH,
                                      video_flags=MediaStream.Flags.IGNORE))
         except Exception as ex:
-            log.warning("play error in %s: %s %s", chat_id, type(ex).__name__, ex)
-            db.log_error(chat_id, "Play failed", ex)
-            name = type(ex).__name__
-            if "NoActiveGroupCall" in name or "GroupCallNotFound" in name:
-                await say(chat_id, "❌ No active voice chat. Start a voice chat in this group and try again.")
+            d = report(chat_id, "Play failed", ex, song)
+            if d.fatal:
+                # e.g. no voice chat / no admin right: every next song would fail the same way,
+                # so stop instead of skipping the whole queue and spamming the group.
+                extra = (f" (or make {assistant_for(chat_id).tag} admin with 'Manage video chats')"
+                         if d.code == "NO_VOICE_CHAT" else "")
+                await say(chat_id, f"❌ {d.user}{extra} [{d.code}]")
                 break
-            if any(k in name for k in ("UserNotParticipant", "ChatForbidden", "ChannelPrivate")):
+            if d.code == "ASSISTANT_REMOVED":
                 _joined.discard(chat_id)  # assistant was removed, re-join next time
-            title = song.get("title") or song.get("page") or "song"
-            reason = f" ({ex})" if isinstance(ex, media.MediaError) else ""
-            await say(chat_id, f"⚠️ Couldn't play '{title}'{reason}, skipping.")
+            title = song.get("title") or song.get("query") or song.get("page") or "song"
+            await say(chat_id, f"⚠️ Couldn't play '{title}': {d.user} [{d.code}]")
             if q and q[0] is song:
                 q.pop(0)
             if not q and _refill_radio(chat_id, q):
@@ -356,8 +504,7 @@ async def _play_safe(chat_id: int, announce: bool = True):
     try:
         await _play_locked(chat_id, announce)
     except Exception as ex:
-        log.exception("player crashed in %s", chat_id)
-        db.log_error(chat_id, "Player crashed", ex)
+        report(chat_id, "Player crashed", ex)
         await say(chat_id, "⚠️ Player error. Stopped, please /play again.")
         await stop_all(chat_id)
 
@@ -439,8 +586,7 @@ async def on_update(_, update):
                 radio_src.pop(update.chat_id, None)
                 _joined.discard(update.chat_id)
     except Exception as ex:
-        log.exception("on_update failed: %s", ex)
-        db.log_error(getattr(update, "chat_id", None), "on_update failed", ex)
+        report(getattr(update, "chat_id", None), "on_update failed", ex)
 
 
 for _a in ASSISTANTS:
@@ -582,19 +728,22 @@ async def play(_, m: Message):
     try:
         await ensure_assistant(m.chat.id)
     except Exception as ex:
-        db.log_error(m.chat.id, "Assistant could not join", ex)
+        report(m.chat.id, "Assistant could not join", ex)
         return await status.edit_text(join_error_text(ex, m.chat.id))
 
     by = m.from_user.first_name if m.from_user else "Unknown"
     if link:  # direct link (YouTube, SoundCloud)
         song = {"title": None, "page": link, "query": None, "by": by, "msg_id": m.id}
     else:
+        search_diag = None
         try:
             found = await media.search(query)
         except Exception as ex:
-            db.log_error(m.chat.id, "Search failed", ex)
+            search_diag = report(m.chat.id, "Search failed", ex)
             found = None
         if not found:
+            if search_diag:  # search itself broke (YouTube block, network...) - not "no such song"
+                return await status.edit_text(f"❌ {search_diag.user} [{search_diag.code}]")
             return await status.edit_text("❌ Song not found.")
         song = {"title": found["title"], "page": found["page"], "query": query, "by": by,
                 "msg_id": m.id, "duration": found.get("duration")}
@@ -785,7 +934,7 @@ async def start_radio(user_id: int, songs: list[tuple], label: str) -> str:
     try:
         await ensure_assistant(chat_id)
     except Exception as ex:
-        db.log_error(chat_id, "Assistant could not join (radio)", ex)
+        report(chat_id, "Assistant could not join (radio)", ex)
         return join_error_text(ex, chat_id)
     async with _locks[chat_id]:
         queues[chat_id] = _radio_items(songs)
@@ -827,9 +976,13 @@ async def radio_cb(_, c: CallbackQuery):
             msg = await start_radio(uid, LANG_ALL[lang], f"{lang} mix")
             await c.message.edit_text(msg)
     except Exception as ex:
-        log.warning("radio cb error: %s", ex)
-        db.log_error(dm_state.get(uid, {}).get("chat"), "Radio menu error", ex)
-        await c.answer("Something went wrong, try again.", show_alert=True)
+        try:
+            if type(ex).__name__ == "MessageNotModified":  # same button pressed twice: harmless
+                return await c.answer()
+            report(dm_state.get(uid, {}).get("chat"), "Radio menu error", ex)
+            await c.answer("Something went wrong, try again.", show_alert=True)
+        except Exception:
+            pass  # query already answered
 
 
 @bot.on_message(filters.private & filters.text & ~filters.regex(r"^/"))
@@ -919,6 +1072,16 @@ async def main():
     await bot.start()
     me = await bot.get_me()
     BOT_USERNAME, BOT_ID = me.username, me.id
+    if STORAGE_CHANNEL:
+        try:
+            ch = await bot.get_chat(STORAGE_CHANNEL)
+            log.info("storage channel OK: %s | songs stored: %s", ch.title, db.tgcache_count())
+        except Exception as ex:
+            log.warning("STORAGE CHANNEL NOT USABLE (%s %s). Make the bot admin there and check "
+                        "STORAGE_CHANNEL id (-100...). Falling back to YouTube only.",
+                        type(ex).__name__, ex)
+    else:
+        log.info("STORAGE_CHANNEL not set: every song comes from YouTube")
     for a in ASSISTANTS:
         await a.client.start()
         await a.call.start()

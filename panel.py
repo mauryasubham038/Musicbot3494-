@@ -277,8 +277,8 @@ async function load() {
       'No cookies loaded (set COOKIES_B64, COOKIES_B64_1, ...).');
     table($('errors_grouped'), ['Error', 'Times', 'Groups', 'Last'],
       d.errors_grouped.map(e => [td(e.msg, 'wrap'), td(e.count), td(e.groups), td(e.last)]), 'No errors in the last 24 hours 🎉');
-    table($('errors_recent'), ['Time', 'Group', 'Error'],
-      d.errors_recent.map(e => [td(e.time), td(e.group), td(e.msg, 'wrap')]), 'No errors.');
+    table($('errors_recent'), ['Time', 'Group', 'Error', 'Details'],
+      d.errors_recent.map(e => [td(e.time), td(e.group), td(e.msg, 'wrap'), td(e.detail, 'wrap')]), 'No errors.');
     table($('daily'), ['Date', 'Added', 'Left'],
       d.daily.map(x => [td(x.date), td(x.added), td(x.left)]), 'No data.');
     table($('monthly'), ['Month', 'Added', 'Left'],
