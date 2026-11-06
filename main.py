@@ -775,6 +775,13 @@ GROUP_TYPES = (ChatType.GROUP, ChatType.SUPERGROUP)
 ACTIVE_STATUS = (ChatMemberStatus.MEMBER, ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER)
 
 
+def _enable_notices(chat_id: int):
+    """Bot just added: welcome + voice chat notices start ON (a choice made earlier is kept)."""
+    for key in ("welcome", "vcnotice"):
+        if not db.setting_get(chat_id, key, ""):
+            db.setting_set(chat_id, key, "1")
+
+
 @bot.on_chat_member_updated(group=5)
 async def track_member(_, u: ChatMemberUpdated):
     try:
@@ -791,6 +798,7 @@ async def track_member(_, u: ChatMemberUpdated):
             db.mark_left(u.chat.id, u.chat.title)
         elif new.status in ACTIVE_STATUS:
             db.mark_added(u.chat.id, u.chat.title)
+            _enable_notices(u.chat.id)
     except Exception as ex:
         log.warning("track error: %s", ex)
 
@@ -801,6 +809,7 @@ async def track_service(_, m: Message):
     try:
         if m.new_chat_members and any(u.id == BOT_ID for u in m.new_chat_members):
             db.mark_added(m.chat.id, m.chat.title)
+            _enable_notices(m.chat.id)
         elif m.left_chat_member and m.left_chat_member.id == BOT_ID:
             db.mark_left(m.chat.id, m.chat.title)
     except Exception as ex:
@@ -1252,46 +1261,101 @@ async def _delete_later(msg: Message | None, secs: int):
         pass
 
 
+_welcomed: dict[tuple[int, int], float] = {}  # (chat, user) -> time: the same join can come twice
+_req_dm: dict[tuple[int, int], float] = {}  # (chat, user) -> time: private message already sent on join request
+
+
+async def _do_welcome(chat, users):
+    """Shared by both triggers (join service message AND chat_member update)."""
+    chat_id = chat.id
+    if not _setting_on(chat_id, "welcome", WELCOME_DEFAULT):
+        return
+    now = time.time()
+    if len(_welcomed) > 5000:
+        _welcomed.clear()
+    fresh = []
+    for u in users:
+        if u.is_bot or u.id == BOT_ID or now - _welcomed.get((chat_id, u.id), 0) < 30:
+            continue
+        _welcomed[(chat_id, u.id)] = now
+        fresh.append(u)
+    users = fresh[:5]
+    if not users:
+        return
+    recent = [t for t in _welcome_log.get(chat_id, []) if now - t < 60]
+    if len(recent) >= 10:  # mass join / raid: stay quiet
+        return
+    recent.append(now)
+    if len(_welcome_log) > 2000:
+        _welcome_log.clear()
+    _welcome_log[chat_id] = recent
+    group = chat.title or "this group"
+    in_group = []
+    for u in users:
+        if _req_dm.pop((chat_id, u.id), 0):  # approval group: he already got the private message
+            continue
+        in_group.append(u)
+    if in_group:  # auto-join group: short welcome in the group
+        names = ", ".join(f'<a href="tg://user?id={u.id}">{html.escape(u.first_name or "friend")}</a>'
+                          for u in in_group)
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton(
+            "🎧 Open bot", url=f"https://t.me/{BOT_USERNAME}?start=hi")]])
+        msg = await say(chat_id, _welcome_text(names, group), parse_mode=ParseMode.HTML,
+                        reply_markup=kb, disable_web_page_preview=True)
+        spawn(_delete_later(msg, 60))
+
+
 @bot.on_message(filters.group & filters.new_chat_members, group=7)
 async def welcome_new(_, m: Message):
-    """Welcome in PRIVATE (name + group name). Telegram only lets a bot write privately to users who
-    already pressed /start in it, so everybody else gets the welcome in the group (auto-deleted)."""
+    """Trigger 1: the "X joined" service message (not sent in big groups / some invite links)."""
     try:
-        chat_id = m.chat.id
-        if not _setting_on(chat_id, "welcome", WELCOME_DEFAULT):
-            return
-        users = [u for u in (m.new_chat_members or []) if not u.is_bot and u.id != BOT_ID][:5]
-        if not users:
-            return
-        now = time.time()
-        recent = [t for t in _welcome_log.get(chat_id, []) if now - t < 60]
-        if len(recent) >= 10:  # mass join / raid: stay quiet
-            return
-        recent.append(now)
-        if len(_welcome_log) > 2000:
-            _welcome_log.clear()
-        _welcome_log[chat_id] = recent
-        group = m.chat.title or "this group"
-        in_group = []
-        for u in users:
-            name = u.first_name or "friend"
-            try:
-                await bot.send_message(u.id, _welcome_text(html.escape(name), group),
-                                       parse_mode=ParseMode.HTML, reply_markup=start_kb(),
-                                       disable_web_page_preview=True)
-            except Exception:  # DM closed (user never started me) -> greet in the group
-                in_group.append(u)
-            await asyncio.sleep(0.3)
-        if in_group:
-            names = ", ".join(f'<a href="tg://user?id={u.id}">{html.escape(u.first_name or "friend")}</a>'
-                              for u in in_group)
-            kb = InlineKeyboardMarkup([[InlineKeyboardButton(
-                "💌 Start me (get messages)", url=f"https://t.me/{BOT_USERNAME}?start=hi")]])
-            msg = await say(chat_id, _welcome_text(names, group), parse_mode=ParseMode.HTML,
-                            reply_markup=kb, disable_web_page_preview=True)
-            spawn(_delete_later(msg, 60))
+        await _do_welcome(m.chat, list(m.new_chat_members or []))
     except Exception as ex:
         log.warning("welcome error: %s", ex)
+
+
+@bot.on_chat_member_updated(group=8)
+async def welcome_by_update(_, u: ChatMemberUpdated):
+    """Trigger 2: member update (works when the join message is hidden). Bot must be admin."""
+    try:
+        if u.chat.type not in GROUP_TYPES:
+            return
+        old, new = u.old_chat_member, u.new_chat_member
+        if not new or new.status != ChatMemberStatus.MEMBER:
+            return
+        if old and old.status in (ChatMemberStatus.MEMBER, ChatMemberStatus.ADMINISTRATOR,
+                                  ChatMemberStatus.OWNER, ChatMemberStatus.RESTRICTED):
+            return  # was already inside (promoted / unrestricted), not a new join
+        await _do_welcome(u.chat, [new.user])
+    except Exception as ex:
+        log.warning("welcome update error: %s", ex)
+
+
+_REQUEST_TEXT = ("👋 Hi {name}!\nYour request to join <b>{group}</b> is sent. "
+                 "You will get in as soon as an admin approves it.\n"
+                 "🎧 I'm a music bot: play any song in the group voice chat with "
+                 "<code>/play song name</code>.")
+
+
+@bot.on_chat_join_request(group=9)
+async def welcome_join_request(_, r):
+    """Someone asked to join (group needs admin approval). Telegram lets the bot write to that
+    person privately right now, even if he never pressed /start. Bot needs 'Invite users' right."""
+    try:
+        chat, user = r.chat, r.from_user
+        if chat.type not in GROUP_TYPES or user.is_bot:
+            return
+        now = time.time()  # private message is always sent, /welcome off does not stop it
+        if len(_req_dm) > 5000:
+            _req_dm.clear()
+        text = (_REQUEST_TEXT.replace("{name}", html.escape(user.first_name or "friend"))
+                .replace("{group}", html.escape(chat.title or "this group")))
+        _req_dm[(chat.id, user.id)] = now  # approval group: no group welcome later (even if DM fails)
+        await bot.send_message(getattr(r, "user_chat_id", None) or user.id, text,
+                               parse_mode=ParseMode.HTML, reply_markup=start_kb(),
+                               disable_web_page_preview=True)
+    except Exception as ex:
+        log.warning("join request welcome error: %s %s", type(ex).__name__, ex)
 
 
 async def _toggle_cmd(m: Message, key: str, default: str, label: str):
