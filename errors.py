@@ -56,6 +56,17 @@ def diagnose(ex: Exception) -> Diag:
     if "Banned" in name or name == "UserKicked":
         return Diag("ASSISTANT_BANNED", "My assistant is banned in this group. Please unban it.",
                     "Assistant account is banned/removed in this group: unban it.", True)
+    if "ChannelsTooMuch" in name:
+        return Diag("ASSISTANT_FULL",
+                    "My assistant account is in too many groups. Please try again later.",
+                    "Assistant account hit Telegram's group limit: add another SESSION_STRING "
+                    "(SESSION_STRINGS) or lower IDLE_LEAVE_DAYS so idle groups are left.", True)
+    if any(k in name for k in ("AuthKeyUnregistered", "SessionRevoked", "SessionExpired",
+                               "UserDeactivated", "AuthKeyDuplicated")):
+        return Diag("ASSISTANT_DEAD",
+                    "My assistant account is not working right now. The owner has been notified.",
+                    "Assistant session is dead (revoked / account banned): make a new SESSION_STRING "
+                    "with gen_session.py and redeploy.", True)
     if name == "InviteRequestSent":
         return Diag("JOIN_REQUEST_PENDING", "Approve the join request of my assistant and try again.",
                     "Group needs admin approval for new members.", True)

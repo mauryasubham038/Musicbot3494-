@@ -69,6 +69,7 @@ async def api_stats(_):
     d = await asyncio.to_thread(db.stats, TIMEZONE)  # heavy queries off the event loop
     d["library"] = library
     tz = ZoneInfo(TIMEZONE)
+    d["assistants"] = assistants_fn() if assistants_fn else []
     d["cookies"] = [dict(c, last_ok=(datetime.fromtimestamp(c["last_ok"], tz).strftime("%d %b, %I:%M %p")
                                      if c["last_ok"] else "-")) for c in media.cookie_status()]
     return web.json_response(d)
@@ -77,6 +78,7 @@ async def api_stats(_):
 # ---------- Broadcast (sab groups me ek saath message) ----------
 library = {"total_songs": 0, "total_singers": 0, "languages": []}  # main.py set karta hai (sirf admin ko dikhta hai)
 broadcast_fn = None  # main.py set karta hai: async fn(text, state)
+assistants_fn = None  # main.py set karta hai: fn() -> [{tag, status, groups, error}]
 bstate = {"running": False, "done": False, "total": 0, "sent": 0, "failed": 0, "removed": 0}
 _task = None
 
@@ -197,6 +199,7 @@ button:disabled{opacity:.5}
 .tag.ok{background:rgba(22,163,74,.15);color:var(--green)}
 .tag.blocked{background:rgba(217,119,6,.18);color:var(--amber)}
 .tag.dead{background:rgba(220,38,38,.15);color:var(--red)}
+.tag.full,.tag.flood{background:rgba(217,119,6,.18);color:var(--amber)}
 .tag.leave{background:rgba(220,38,38,.15);color:var(--red)}
 </style>
 </head>
@@ -226,6 +229,9 @@ button:disabled{opacity:.5}
 
   <h2>🎵 Song library <span class="sub">(only you can see this)</span></h2>
   <div class="box" id="library"></div>
+
+  <h2>🤖 Assistants <span class="sub">(status resets on restart)</span></h2>
+  <div class="box" id="assistants"></div>
 
   <h2>🍪 YouTube cookies <span class="sub">(status resets on restart)</span></h2>
   <div class="box" id="cookies"></div>
@@ -269,6 +275,11 @@ async function load() {
       lib.languages.map(x => [td(x.language), td(x.songs), td(x.singers)])
         .concat([['<td><b>Total</b></td>', '<td><b>' + esc(lib.total_songs) + '</b></td>', '<td><b>' + esc(lib.total_singers) + '</b></td>']]),
       'No songs loaded (songs.csv missing?).');
+    table($('assistants'), ['Assistant', 'Status', 'Groups', 'Last problem'],
+      (d.assistants || []).map(a => [td(a.tag),
+        '<td><span class="tag ' + esc(a.status) + '">' + esc(String(a.status).toUpperCase()) + '</span></td>',
+        td(a.groups), td(a.error, 'wrap')]),
+      'No assistants.');
     table($('cookies'), ['Cookie', 'Status', 'Used', 'Blocked', 'Last OK', 'Last error', ''],
       (d.cookies || []).map(c => [td(c.name),
         '<td><span class="tag ' + esc(c.status) + '">' + (c.status === 'ok' ? 'OK' : c.status === 'blocked' ? 'BLOCKED (' + esc(c.rest_min) + ' min)' : 'DEAD') + '</span></td>',

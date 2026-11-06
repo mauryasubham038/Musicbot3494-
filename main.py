@@ -15,6 +15,7 @@ import re
 import time
 from collections import defaultdict
 from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 
 from dotenv import load_dotenv
 from pyrogram import Client, filters, idle
@@ -53,6 +54,15 @@ bot = Client("bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN, in_me
 # One Telegram user account can only be in so many groups / join so fast. For big scale put
 # several accounts in SESSION_STRINGS (comma or newline separated). Each group is assigned to
 # the assistant that currently has the fewest groups and keeps it.
+TZ = ZoneInfo(os.environ.get("TIMEZONE", "Asia/Kolkata"))
+OWNER_ID = int(os.environ.get("OWNER_ID", "0") or 0)  # gets private alerts (dead assistant ...)
+IDLE_LEAVE_DAYS = int(os.environ.get("IDLE_LEAVE_DAYS", "30"))  # 0 = assistant never leaves idle groups
+RESUME_WAIT = int(os.environ.get("RESUME_WAIT", "300"))  # seconds we wait for a manually added assistant
+FULL_REST = 6 * 3600  # an assistant that is "in too many groups" is not used for this long
+DEAD_ERRORS = ("AuthKeyUnregistered", "SessionRevoked", "SessionExpired", "UserDeactivated",
+               "AuthKeyDuplicated")
+
+
 class Assistant:
     def __init__(self, idx: int, session: str):
         self.idx = idx
@@ -61,11 +71,32 @@ class Assistant:
         self.call = PyTgCalls(self.client)
         self.join_lock = asyncio.Lock()  # joins are spaced out -> no FloodWait
         self.chats = 0
+        self.uid = 0  # Telegram user id (known after start)
+        self.dead = False  # session revoked / account deactivated / failed to start
+        self.full_until = 0.0  # "too many groups": rests until this time
+        self.flood_until = 0.0  # FloodWait: rests until this time
+        self.last_error = ""
 
     @property
     def tag(self) -> str:
         me = getattr(self.client, "me", None)
         return f"@{me.username}" if me and getattr(me, "username", None) else f"assistant {self.idx + 1}"
+
+    @property
+    def healthy(self) -> bool:
+        now = time.time()
+        return not self.dead and self.full_until <= now and self.flood_until <= now
+
+    @property
+    def status(self) -> str:
+        now = time.time()
+        if self.dead:
+            return "dead"
+        if self.full_until > now:
+            return "full"
+        if self.flood_until > now:
+            return "flood"
+        return "ok"
 
 
 _sessions: list[str] = []
@@ -76,20 +107,80 @@ for _s in re.split(r"[,\s]+", (os.environ.get("SESSION_STRINGS", "") + "," +
 if not _sessions:
     raise SystemExit("Set SESSION_STRING (or SESSION_STRINGS for several assistants).")
 ASSISTANTS = [Assistant(i, s) for i, s in enumerate(_sessions)]
-_assigned: dict[int, Assistant] = {}
+ASSISTANT_BY_ID: dict[int, Assistant] = {}  # filled after the assistants started
+_assigned: dict[int, Assistant] = {}  # chat -> assistant (also saved in the DB, survives restarts)
+
+
+def _pick_assistant(exclude=()) -> Assistant | None:
+    """Healthy assistant with the fewest groups; if none is healthy, any that is not dead."""
+    alive = [a for a in ASSISTANTS if not a.dead and a not in exclude]
+    if not alive:
+        return None
+    return min([a for a in alive if a.healthy] or alive, key=lambda x: x.chats)
+
+
+def _set_assignment(chat_id: int, a: Assistant):
+    old = _assigned.get(chat_id)
+    if old is a:
+        return
+    if old is not None:
+        old.chats = max(0, old.chats - 1)
+    _assigned[chat_id] = a
+    a.chats += 1
+    _joined.discard(chat_id)  # new assistant: membership must be checked again
+    if a.uid:
+        db.assign_put(chat_id, a.uid)
+
+
+def _peek_assistant(chat_id: int) -> Assistant:
+    """Like assistant_for() but never creates / saves an assignment (used by /setup)."""
+    return _assigned.get(chat_id) or _pick_assistant() or ASSISTANTS[0]
 
 
 def assistant_for(chat_id: int) -> Assistant:
     a = _assigned.get(chat_id)
-    if a is None:
-        a = min(ASSISTANTS, key=lambda x: x.chats)
-        a.chats += 1
-        _assigned[chat_id] = a
+    if a is None or a.dead:  # new group, or its assistant died -> give it a living one
+        a = _pick_assistant() or ASSISTANTS[0]
+        _set_assignment(chat_id, a)
     return a
 
 
 def call_for(chat_id: int) -> PyTgCalls:
     return assistant_for(chat_id).call
+
+
+def call_existing(chat_id: int) -> PyTgCalls:
+    """For pause/resume: raises if this group never had an assistant (nothing is playing)."""
+    a = _assigned.get(chat_id)
+    if a is None:
+        raise RuntimeError("no assistant for this chat")
+    return a.call
+
+
+def load_assignments():
+    """After a restart: which assistant belongs to which group (saved in the DB)."""
+    n = 0
+    for chat_id, aid, _last in db.assign_all():
+        a = ASSISTANT_BY_ID.get(aid)
+        if a is not None:
+            _assigned[chat_id] = a
+            a.chats += 1
+            n += 1
+    log.info("assistant assignments restored: %s", n)
+
+
+_notice_last: dict[tuple, float] = {}  # (key...) -> last time: stops repeated notices
+
+
+def _once(key: tuple, every: float = 600) -> bool:
+    """True if this notice was not sent within the last `every` seconds."""
+    now = time.time()
+    if now - _notice_last.get(key, 0) < every:
+        return False
+    if len(_notice_last) > 5000:
+        _notice_last.clear()
+    _notice_last[key] = now
+    return True
 
 
 # Sab kuch RAM me. Restart par sab saaf, koi record nahi.
@@ -252,20 +343,24 @@ async def _deny(m: Message) -> bool:
     return True
 
 
-async def _assistant_is_member(a: Assistant, chat_id: int) -> bool:
-    """Is the assistant already in the group? Asked twice: by the assistant itself and, if that
-    fails (assistant has no cached info about the group after a restart), by the bot."""
+async def _assistant_member(a: Assistant, chat_id: int):
+    """The assistant's ChatMember in the group (None = not in the group / unknown). Asked twice:
+    by the assistant itself and, if that fails (assistant has no cached info about the group after
+    a restart), by the bot."""
     try:
-        m = await a.client.get_chat_member(chat_id, "me")
-        return m.status not in (ChatMemberStatus.LEFT, ChatMemberStatus.BANNED)
+        return await a.client.get_chat_member(chat_id, "me")
     except Exception:
         pass
     try:
-        me = a.client.me or await a.client.get_me()
-        m = await bot.get_chat_member(chat_id, me.id)
-        return m.status not in (ChatMemberStatus.LEFT, ChatMemberStatus.BANNED)
+        uid = a.uid or (a.client.me.id if a.client.me else (await a.client.get_me()).id)
+        return await bot.get_chat_member(chat_id, uid)
     except Exception:
-        return False
+        return None
+
+
+async def _assistant_is_member(a: Assistant, chat_id: int) -> bool:
+    m = await _assistant_member(a, chat_id)
+    return m is not None and m.status not in (ChatMemberStatus.LEFT, ChatMemberStatus.BANNED)
 
 
 async def _fresh_link(chat_id: int) -> str:
@@ -312,14 +407,74 @@ async def _join(a: Assistant, chat_id: int):
     raise last  # type: ignore[misc]
 
 
-async def ensure_assistant(chat_id: int):
-    if chat_id in _joined:
+async def notify_owner(key: str, text: str, every: float = 3600):
+    """Private alert to OWNER_ID (he must have pressed /start in the bot once)."""
+    if OWNER_ID and _once(("owner", key), every):
+        await say(OWNER_ID, text)
+
+
+def _mark_dead(a: Assistant, ex: Exception):
+    if a.dead:
         return
-    a = assistant_for(chat_id)
-    if not await _assistant_is_member(a, chat_id):
-        async with a.join_lock:
-            await _join(a, chat_id)
-            await asyncio.sleep(1.5)  # space out joins of one account (FloodWait protection)
+    a.dead = True
+    a.last_error = f"{type(ex).__name__}: {ex}"[:200]
+    report(None, f"Assistant {a.tag} session is dead", ex)
+    db.log_error(None, f"Assistant {a.tag} is dead", None, code="ASSISTANT_DEAD",
+                 hint="Session revoked or account banned: make a new SESSION_STRING (gen_session.py)",
+                 detail=a.last_error)
+    spawn(notify_owner(f"dead:{a.idx}", f"🚨 Assistant {a.tag} is DEAD ({type(ex).__name__}). "
+                                        "Make a new SESSION_STRING for it and redeploy.", 6 * 3600))
+
+
+async def ensure_assistant(chat_id: int):
+    cur = _assigned.get(chat_id)
+    if chat_id in _joined and cur is not None and not cur.dead:
+        return
+    # Several assistants and no saved assignment: maybe one of them is already inside this group.
+    if cur is None and len(ASSISTANTS) > 1:
+        for cand in ASSISTANTS:
+            if not cand.dead and await _assistant_is_member(cand, chat_id):
+                _set_assignment(chat_id, cand)
+                break
+    tried: set[Assistant] = set()
+    flood_retry = False
+    for _ in range(len(ASSISTANTS) + 3):
+        a = assistant_for(chat_id)
+        if await _assistant_is_member(a, chat_id):
+            break
+        try:
+            async with a.join_lock:
+                await _join(a, chat_id)
+                await asyncio.sleep(1.5)  # space out joins of one account (FloodWait protection)
+            break
+        except Exception as ex:
+            name = type(ex).__name__
+            other = None
+            if name == "FloodWait":
+                secs = int(getattr(ex, "value", 30) or 30)
+                if secs <= 30 and not flood_retry:  # short wait: just wait and try once more
+                    flood_retry = True
+                    await asyncio.sleep(secs + 1)
+                    continue
+                a.flood_until = time.time() + secs
+                a.last_error = f"FloodWait {secs}s"
+            elif "ChannelsTooMuch" in name:  # this account cannot join more groups
+                a.full_until = time.time() + FULL_REST
+                a.last_error = "in too many groups"
+                db.log_error(chat_id, f"Assistant {a.tag} is full", None, code="ASSISTANT_FULL",
+                             hint="Add another SESSION_STRING (SESSION_STRINGS) or lower IDLE_LEAVE_DAYS",
+                             detail=f"{name}: {ex}")
+            elif any(k in name for k in DEAD_ERRORS):
+                _mark_dead(a, ex)
+            else:
+                raise  # banned / no invite right / join request ...: caller shows the reason
+            tried.add(a)
+            other = _pick_assistant(exclude=tried)
+            if other is None or not other.healthy:
+                raise
+            _set_assignment(chat_id, other)  # another assistant takes this group
+    else:
+        raise RuntimeError("no assistant could join this group")
     _joined.add(chat_id)
 
 
@@ -338,8 +493,10 @@ def join_error_text(ex: Exception, chat_id: int) -> str:
 # (its file_id is saved in SQLite). Next time ANY group asks for the same song it is downloaded
 # from Telegram (fast, no YouTube request, no cookie use). If anything fails -> YouTube is used.
 STORAGE_CHANNEL = int(os.environ.get("STORAGE_CHANNEL", "0") or 0)
+UPLOAD_GAP = float(os.environ.get("UPLOAD_GAP", "3"))  # seconds between two uploads (FloodWait)
+MAX_UPLOAD_BACKLOG = int(os.environ.get("MAX_UPLOAD_BACKLOG", "40"))  # more waiting = skip (re-stored later)
 _uploading: set[str] = set()
-_upload_sem = asyncio.Semaphore(2)
+_upload_lock = asyncio.Lock()  # one upload at a time, with a pause after each
 
 
 def _cache_key(song: dict) -> str | None:
@@ -373,15 +530,32 @@ async def _from_telegram(key: str, row: dict) -> str:
 
 
 async def _upload_to_channel(key: str, path: str, title: str | None, dur, page: str | None):
-    if key in _uploading:
+    if key in _uploading or len(_uploading) >= MAX_UPLOAD_BACKLOG:
         return
     _uploading.add(key)
     try:
-        if await asyncio.to_thread(db.tgcache_get, key):
+        if db.tgcache_has(key):
             return
-        async with _upload_sem:
-            m = await bot.send_audio(STORAGE_CHANNEL, path, title=(title or "")[:60],
-                                     duration=int(dur or 0), caption=f"{key}\n{page or ''}"[:900])
+        async with _upload_lock:
+            try:
+                if not os.path.exists(path):  # cache cleanup removed it while we waited
+                    return
+                m = None
+                for attempt in range(2):
+                    try:
+                        m = await bot.send_audio(STORAGE_CHANNEL, path, title=(title or "")[:60],
+                                                 duration=int(dur or 0),
+                                                 caption=f"{key}\n{page or ''}"[:900])
+                        break
+                    except Exception as ex:
+                        if type(ex).__name__ == "FloodWait" and attempt == 0:
+                            await asyncio.sleep(int(getattr(ex, "value", 10) or 10) + 1)
+                            continue
+                        raise
+            finally:
+                await asyncio.sleep(UPLOAD_GAP)  # pause after every upload, even a failed one
+        if m is None:
+            return
         media_obj = m.audio or m.document
         if not media_obj:
             return
@@ -487,6 +661,7 @@ async def _play_locked(chat_id: int, announce: bool = True):
             continue
         # ---- playing: the "Now playing" message is separate, its failure must not skip the song
         song["started"] = time.time()
+        db.assign_touch(chat_id)  # assistant is in use (idle-leave looks at this)
         song.pop("paused_at", None)
         song.pop("wd", None)
         if announce:
@@ -525,10 +700,12 @@ async def stop_all(chat_id: int):
     queues.pop(chat_id, None)
     loops.pop(chat_id, None)
     radio_src.pop(chat_id, None)
-    try:
-        await call_for(chat_id).leave_call(chat_id)
-    except Exception:
-        pass
+    a = _assigned.get(chat_id)
+    if a is not None:  # no assistant = nothing to leave (and no assignment gets created)
+        try:
+            await a.call.leave_call(chat_id)
+        except Exception:
+            pass
 
 
 async def _on_stream_end(chat_id: int, expect: dict | None = None):
@@ -605,6 +782,9 @@ async def track_member(_, u: ChatMemberUpdated):
             return
         old, new = u.old_chat_member, u.new_chat_member
         member = new or old
+        if member and member.user.id in ASSISTANT_BY_ID:  # one of OUR assistants changed
+            await assistant_member_changed(u, ASSISTANT_BY_ID[member.user.id])
+            return
         if not member or member.user.id != BOT_ID:
             return
         if new is None or new.status in (ChatMemberStatus.LEFT, ChatMemberStatus.BANNED):
@@ -629,19 +809,29 @@ async def track_service(_, m: Message):
 
 # ---------------- Commands ----------------
 START_PHOTO = os.environ.get("START_PHOTO", "")  # URL / file_id; else assets/start.jpg is used
-SUPPORT_URL = os.environ.get("SUPPORT_URL", "")  # e.g. https://t.me/YourSupportGroup
+SUPPORT_URL = os.environ.get("SUPPORT_URL", "https://t.me/ZenithSsupport")
+UPDATE_URL_ENV = os.environ.get("UPDATE_URL", "")  # update channel link (owner can also change it with /setupdate)
+
+
+def update_url() -> str:
+    """Update channel link: /setupdate (saved in DB) wins, else UPDATE_URL env."""
+    return db.setting_get(0, "update_url", "") or UPDATE_URL_ENV
 START_TEXT = (
     "🎧 <b>Powerful music bot, never falls!</b>\n\n"
     "Lag-free, high quality songs in your group voice chat.\n"
     "Add me to your group, make me admin and enjoy the music.\n\n"
-    "<b>Tap Commands to see everything I can do.</b>"
+    "<b>Tap Help to see everything I can do.</b>"
 )
 HELP_TEXT = (
-    "<b>Commands</b>\n\n"
+    "<b>Help - Commands</b>\n\n"
     "/play <i>song name or link</i> - play a song\n"
     "/pause - pause\n/resume - resume\n/skip - next song\n"
     "/stop - stop and leave\n/queue - show queue\n/loop - loop on/off\n"
-    "/radio - radio (admins only)"
+    "/radio - radio (admins only)\n\n"
+    "<b>Admins</b>\n"
+    "/setup - check what is missing (bot rights, assistant, voice chat)\n"
+    "/vcnotice on|off - voice chat start/end messages\n"
+    "/welcome on|off - welcome new members"
 )
 
 
@@ -651,10 +841,13 @@ def start_kb(back: bool = False) -> InlineKeyboardMarkup:
     rows = [[InlineKeyboardButton(
         "➕ Add me to your group",
         url=f"https://t.me/{BOT_USERNAME}?startgroup=true&admin=manage_video_chats+delete_messages+invite_users")]]
-    row2 = [InlineKeyboardButton("📖 Commands", callback_data="cmds")]
+    row1 = [InlineKeyboardButton("📖 Help", callback_data="cmds")]
     if SUPPORT_URL:
-        row2.append(InlineKeyboardButton("💬 Support", url=SUPPORT_URL))
-    rows.append(row2)
+        row1.append(InlineKeyboardButton("💬 Support", url=SUPPORT_URL))
+    rows.append(row1)
+    upd = update_url()
+    if upd:
+        rows.append([InlineKeyboardButton("📢 Update", url=upd)])
     return InlineKeyboardMarkup(rows)
 
 
@@ -697,6 +890,32 @@ async def start(_, m: Message):
     await _start_help(m)
 
 
+@bot.on_message(filters.command("help"))
+async def help_cmd(_, m: Message):
+    """/help: full command list (group or private)."""
+    await m.reply_text(HELP_TEXT, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+
+
+@bot.on_message(filters.command("setupdate") & filters.private)
+async def set_update(_, m: Message):
+    """Owner only: /setupdate https://t.me/channel  (or /setupdate off)."""
+    if not OWNER_ID or m.from_user.id != OWNER_ID:
+        return
+    arg = m.command[1].strip() if len(m.command) > 1 else ""
+    if not arg:
+        return await m.reply_text(f"Current update link: {update_url() or 'not set'}\n\n"
+                                  "Change: /setupdate https://t.me/YourChannel\nRemove: /setupdate off")
+    if arg.lower() == "off":
+        db.setting_set(0, "update_url", "")
+        return await m.reply_text("✅ Update button removed.")
+    if arg.startswith("@"):
+        arg = "https://t.me/" + arg[1:]
+    if not arg.startswith("http"):
+        return await m.reply_text("❌ Send a link like https://t.me/YourChannel or @YourChannel")
+    db.setting_set(0, "update_url", arg)
+    await m.reply_text(f"✅ Update button set: {arg}")
+
+
 @bot.on_message(filters.command("play") & filters.group)
 async def play(_, m: Message):
     query = m.text.split(None, 1)[1].strip() if len(m.command) > 1 else ""
@@ -725,49 +944,126 @@ async def play(_, m: Message):
 
     db.seen(m.chat.id, m.chat.title)
     status = await m.reply_text("🔎 Searching...")
+    by = m.from_user.first_name if m.from_user else "Unknown"
     try:
         await ensure_assistant(m.chat.id)
     except Exception as ex:
-        report(m.chat.id, "Assistant could not join", ex)
-        return await status.edit_text(join_error_text(ex, m.chat.id))
+        d = report(m.chat.id, "Assistant could not join", ex)
+        text = join_error_text(ex, m.chat.id)
+        if d.code in WAITABLE:  # a human can fix it -> keep the song and start it when fixed
+            return await _wait_for_assistant(
+                m.chat.id, status, {"query": query, "link": link, "by": by, "msg_id": m.id}, text)
+        return await status.edit_text(text)
+    await _run_request(m.chat.id, query, link, by, m.id, status)
 
-    by = m.from_user.first_name if m.from_user else "Unknown"
+
+async def _run_request(chat_id: int, query: str, link: str | None, by: str, msg_id: int | None,
+                       status: Message | None):
+    """Find the song (search if it is a name), queue it and start playing when the queue was empty.
+    `status` = the 'Searching...' message that is edited (None: plain replies in the group)."""
+    async def reply(text: str):
+        if status is not None:
+            try:
+                return await status.edit_text(text)
+            except Exception:
+                pass
+        return await say(chat_id, text, reply_to_message_id=msg_id)
+
     if link:  # direct link (YouTube, SoundCloud)
-        song = {"title": None, "page": link, "query": None, "by": by, "msg_id": m.id}
+        song = {"title": None, "page": link, "query": None, "by": by, "msg_id": msg_id}
     else:
         search_diag = None
         try:
             found = await media.search(query)
         except Exception as ex:
-            search_diag = report(m.chat.id, "Search failed", ex)
+            search_diag = report(chat_id, "Search failed", ex)
             found = None
         if not found:
             if search_diag:  # search itself broke (YouTube block, network...) - not "no such song"
-                return await status.edit_text(f"❌ {search_diag.user} [{search_diag.code}]")
-            return await status.edit_text("❌ Song not found.")
+                return await reply(f"❌ {search_diag.user} [{search_diag.code}]")
+            return await reply("❌ Song not found.")
         song = {"title": found["title"], "page": found["page"], "query": query, "by": by,
-                "msg_id": m.id, "duration": found.get("duration")}
+                "msg_id": msg_id, "duration": found.get("duration")}
 
-    q = queues.setdefault(m.chat.id, [])
+    q = queues.setdefault(chat_id, [])
     q.append(song)
     if len(q) == 1:
-        await status.edit_text("⬇️ Preparing audio...")
-        await play_next(m.chat.id, status=status)
+        await reply("⬇️ Preparing audio...")
+        await play_next(chat_id, status=status)
     else:
-        await status.edit_text(f"➕ Added to queue #{len(q) - 1}: {song['title'] or 'link'}")
+        await reply(f"➕ Added to queue #{len(q) - 1}: {song['title'] or 'link'}")
         if len(q) == 2:
             spawn(_prefetch(q))
 
 
+# ---------------- Assistant could not join: wait, then start the song automatically ----------------
+# Join problems a human can fix (add the assistant by hand, give 'Invite users', unban, approve...).
+WAITABLE = {"INVITE_LINK_DEAD", "BOT_NEEDS_INVITE_RIGHT", "ADMIN_REQUIRED", "JOIN_REQUEST_PENDING",
+            "ASSISTANT_BANNED", "UNKNOWN"}
+_pending: dict[int, list[dict]] = {}  # chat -> requests waiting for the assistant
+_waiting: set[int] = set()  # chats that have a waiter task running
+
+
+async def _wait_for_assistant(chat_id: int, status: Message, item: dict, reason: str):
+    item["status"] = status
+    lst = _pending.setdefault(chat_id, [])
+    if len(lst) < 5:
+        lst.append(item)
+    tag = _peek_assistant(chat_id).tag
+    try:
+        await status.edit_text(f"{reason}\n\n⏳ Fix this (or add {tag} to the group by hand). "
+                               f"I will start your song by myself within {RESUME_WAIT // 60} min.")
+    except Exception:
+        pass
+    if chat_id not in _waiting:
+        _waiting.add(chat_id)
+        spawn(_resume_when_joined(chat_id))
+
+
+async def _resume_when_joined(chat_id: int):
+    """Every 8 s: is the assistant in the group now? Every ~32 s: try to bring it in again (the
+    admin may have just given me 'Invite users'). When it is in: play everything that was waiting."""
+    try:
+        end, n = time.time() + RESUME_WAIT, 0
+        while time.time() < end:
+            await asyncio.sleep(8)
+            n += 1
+            a = assistant_for(chat_id)
+            ok = await _assistant_is_member(a, chat_id)
+            if not ok and n % 4 == 0:
+                try:
+                    await ensure_assistant(chat_id)
+                    ok = True
+                except Exception as ex:
+                    log.debug("resume: join retry failed: %s", ex)
+                    a = assistant_for(chat_id)
+            if ok:
+                _joined.add(chat_id)
+                items = _pending.pop(chat_id, [])
+                await say(chat_id, f"✅ {assistant_for(chat_id).tag} is in the group. Starting your song...")
+                for it in items:
+                    await _run_request(chat_id, it["query"], it["link"], it["by"], it["msg_id"],
+                                       it.get("status"))
+                return
+        _pending.pop(chat_id, None)
+        await say(chat_id, "⌛ My assistant did not join in time. Please fix it and send /play again "
+                           "(send /setup to see what is missing).")
+    except Exception as ex:
+        report(chat_id, "Resume waiter crashed", ex)
+        _pending.pop(chat_id, None)
+    finally:
+        _waiting.discard(chat_id)
+
+
 async def do_pause(chat_id: int):
-    await call_for(chat_id).pause(chat_id)
+    await call_existing(chat_id).pause(chat_id)
     q = queues.get(chat_id)
     if q and not q[0].get("paused_at"):
         q[0]["paused_at"] = time.time()
 
 
 async def do_resume(chat_id: int):
-    await call_for(chat_id).resume(chat_id)
+    await call_existing(chat_id).resume(chat_id)
     q = queues.get(chat_id)
     if q:
         p = q[0].pop("paused_at", None)
@@ -850,6 +1146,337 @@ async def queue_cmd(_, m: Message):
     if len(q) > 11:
         text += f"...and {len(q) - 11} more"
     await m.reply_text(text)
+
+
+# ---------------- Notices: assistant banned, voice chat started / ended, welcome ----------------
+VC_NOTICE_DEFAULT = os.environ.get("VC_NOTICE_DEFAULT", "1")  # "1" = on for groups that never chose
+WELCOME_DEFAULT = os.environ.get("WELCOME_DEFAULT", "1")
+WELCOME_TEXT = os.environ.get("WELCOME_TEXT", "")  # optional, use {name} and {group}
+_DEFAULT_WELCOME = ("👋 Welcome {name}!\nYou joined <b>{group}</b>.\n"
+                    "🎧 I'm a music bot: play any song in the group voice chat with "
+                    "<code>/play song name</code>.")
+_welcome_log: dict[int, list[float]] = {}  # chat -> recent welcome times (mass-join guard)
+
+
+def _fmt_clock(ts: float | None = None) -> str:
+    return datetime.fromtimestamp(ts or time.time(), TZ).strftime("%I:%M %p").lstrip("0")
+
+
+def _fmt_span(sec) -> str:
+    sec = int(sec or 0)
+    h, rem = divmod(sec, 3600)
+    mi, s = divmod(rem, 60)
+    return f"{h}h {mi}m" if h else (f"{mi} min" if mi else f"{s} sec")
+
+
+def _setting_on(chat_id: int, key: str, default: str) -> bool:
+    return (db.setting_get(chat_id, key, "") or default) == "1"
+
+
+def _msg_ts(m: Message) -> float:
+    try:
+        return m.date.timestamp()
+    except Exception:
+        return time.time()
+
+
+async def _is_admin_msg(m: Message) -> bool:
+    """Real admin check (not affected by CONTROLS_ADMIN_ONLY): for /setup and settings."""
+    if m.sender_chat and m.sender_chat.id == m.chat.id:  # anonymous admin
+        return True
+    return m.from_user is not None and await is_admin(m.chat.id, m.from_user.id)
+
+
+async def assistant_member_changed(u: ChatMemberUpdated, a: Assistant):
+    """One of our assistants was banned / unbanned / removed in a group: tell the group."""
+    chat_id = u.chat.id
+    old, new = u.old_chat_member, u.new_chat_member
+    st = new.status if new else ChatMemberStatus.LEFT
+    was = old.status if old else None
+    if st in (ChatMemberStatus.BANNED, ChatMemberStatus.LEFT):
+        _joined.discard(chat_id)  # next /play checks again / rejoins
+    if st == ChatMemberStatus.BANNED:
+        db.log_error(chat_id, f"Assistant {a.tag} is banned in this group", None,
+                     code="ASSISTANT_BANNED", hint="Unban the assistant in the group's removed-users list",
+                     detail=f"assistant={a.tag} chat={chat_id}")
+        if _once(("ban", chat_id)):
+            await say(chat_id, f"🚫 My assistant {a.tag} is BANNED in this group, so I can't play music.\n"
+                               "Please unban it (open the group's 'Removed users' list and unban it), "
+                               "then send /play.")
+    elif was == ChatMemberStatus.BANNED:
+        if _once(("unban", chat_id)):
+            await say(chat_id, f"✅ Assistant {a.tag} is unbanned. Send /play to start the music.")
+    elif st == ChatMemberStatus.LEFT and queues.get(chat_id):
+        if _once(("left", chat_id)):
+            await say(chat_id, f"⚠️ My assistant {a.tag} was removed from this group. "
+                               "I will bring it back on the next /play.")
+
+
+@bot.on_message(filters.group & filters.video_chat_started, group=7)
+async def vc_started(_, m: Message):
+    try:
+        if _setting_on(m.chat.id, "vcnotice", VC_NOTICE_DEFAULT):
+            await say(m.chat.id, f"🎙 Voice chat started at {_fmt_clock(_msg_ts(m))}.\n"
+                                 "Send /play song name to play music.")
+    except Exception as ex:
+        log.warning("vc_started error: %s", ex)
+
+
+@bot.on_message(filters.group & filters.video_chat_ended, group=7)
+async def vc_ended(_, m: Message):
+    chat_id = m.chat.id
+    try:
+        had = bool(queues.get(chat_id))
+        if had:  # the voice chat is gone: drop the stale queue / loop / call
+            await stop_all(chat_id)
+        if _setting_on(chat_id, "vcnotice", VC_NOTICE_DEFAULT):
+            dur = getattr(m.video_chat_ended, "duration", 0)
+            text = f"🔇 Voice chat ended at {_fmt_clock(_msg_ts(m))}"
+            text += f" (it lasted {_fmt_span(dur)})" if dur else ""
+            await say(chat_id, text + (". Queue cleared." if had else "."))
+    except Exception as ex:
+        log.warning("vc_ended error: %s", ex)
+
+
+def _welcome_text(name_html: str, group: str) -> str:
+    tpl = WELCOME_TEXT or _DEFAULT_WELCOME
+    return tpl.replace("{name}", name_html).replace("{group}", html.escape(group))
+
+
+async def _delete_later(msg: Message | None, secs: int):
+    await asyncio.sleep(secs)
+    try:
+        if msg:
+            await msg.delete()
+    except Exception:
+        pass
+
+
+@bot.on_message(filters.group & filters.new_chat_members, group=7)
+async def welcome_new(_, m: Message):
+    """Welcome in PRIVATE (name + group name). Telegram only lets a bot write privately to users who
+    already pressed /start in it, so everybody else gets the welcome in the group (auto-deleted)."""
+    try:
+        chat_id = m.chat.id
+        if not _setting_on(chat_id, "welcome", WELCOME_DEFAULT):
+            return
+        users = [u for u in (m.new_chat_members or []) if not u.is_bot and u.id != BOT_ID][:5]
+        if not users:
+            return
+        now = time.time()
+        recent = [t for t in _welcome_log.get(chat_id, []) if now - t < 60]
+        if len(recent) >= 10:  # mass join / raid: stay quiet
+            return
+        recent.append(now)
+        if len(_welcome_log) > 2000:
+            _welcome_log.clear()
+        _welcome_log[chat_id] = recent
+        group = m.chat.title or "this group"
+        in_group = []
+        for u in users:
+            name = u.first_name or "friend"
+            try:
+                await bot.send_message(u.id, _welcome_text(html.escape(name), group),
+                                       parse_mode=ParseMode.HTML, reply_markup=start_kb(),
+                                       disable_web_page_preview=True)
+            except Exception:  # DM closed (user never started me) -> greet in the group
+                in_group.append(u)
+            await asyncio.sleep(0.3)
+        if in_group:
+            names = ", ".join(f'<a href="tg://user?id={u.id}">{html.escape(u.first_name or "friend")}</a>'
+                              for u in in_group)
+            kb = InlineKeyboardMarkup([[InlineKeyboardButton(
+                "💌 Start me (get messages)", url=f"https://t.me/{BOT_USERNAME}?start=hi")]])
+            msg = await say(chat_id, _welcome_text(names, group), parse_mode=ParseMode.HTML,
+                            reply_markup=kb, disable_web_page_preview=True)
+            spawn(_delete_later(msg, 60))
+    except Exception as ex:
+        log.warning("welcome error: %s", ex)
+
+
+async def _toggle_cmd(m: Message, key: str, default: str, label: str):
+    if not await _is_admin_msg(m):
+        return await m.reply_text("🔒 Only admins can change this.")
+    arg = m.command[1].lower() if len(m.command) > 1 else ""
+    if arg in ("on", "off"):
+        db.setting_set(m.chat.id, key, "1" if arg == "on" else "0")
+        return await m.reply_text(f"{label}: {'ON ✅' if arg == 'on' else 'OFF ⛔'}")
+    cur = _setting_on(m.chat.id, key, default)
+    await m.reply_text(f"{label} is {'ON' if cur else 'OFF'}.\n"
+                       f"Change: /{m.command[0]} on  or  /{m.command[0]} off")
+
+
+@bot.on_message(filters.command("vcnotice") & filters.group)
+async def vcnotice_cmd(_, m: Message):
+    await _toggle_cmd(m, "vcnotice", VC_NOTICE_DEFAULT, "Voice chat notices")
+
+
+@bot.on_message(filters.command("welcome") & filters.group)
+async def welcome_cmd(_, m: Message):
+    await _toggle_cmd(m, "welcome", WELCOME_DEFAULT, "Welcome messages")
+
+
+# ---------------- /setup: what is missing in this group? ----------------
+def _right(member, name: str):
+    p = getattr(member, "privileges", None)
+    return None if p is None else bool(getattr(p, name, False))
+
+
+@bot.on_message(filters.command("setup") & filters.group)
+async def setup_cmd(_, m: Message):
+    if not await _is_admin_msg(m):
+        return await m.reply_text("🔒 Only admins can run /setup.")
+    chat_id = m.chat.id
+    if not _once(("setup", chat_id), 15):
+        return await m.reply_text("⏳ Please wait a few seconds.")
+    ok, bad, warn = "✅", "❌", "⚠️"
+    lines, fixes = ["🔧 <b>Setup check</b>", ""], []
+    ADM = (ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER)
+
+    # 1) the bot
+    try:
+        bm = await bot.get_chat_member(chat_id, BOT_ID)
+    except Exception:
+        bm = None
+    is_adm = bm is not None and bm.status in ADM
+    lines.append(f"{ok if is_adm else bad} I am admin")
+    if not is_adm:
+        fixes.append("Make me admin and give me the 'Invite users' right.")
+    else:
+        inv = _right(bm, "can_invite_users")
+        lines.append(f"{bad if inv is False else ok} Right 'Invite users' (to bring my assistant)")
+        if inv is False:
+            fixes.append("Give me the admin right 'Invite users'.")
+
+    # 2) the assistant
+    a = _peek_assistant(chat_id)
+    tag = html.escape(a.tag)
+    am = await _assistant_member(a, chat_id)
+    st = am.status if am else None
+    if a.dead:
+        lines.append(f"{bad} Assistant {tag}: account is dead (session revoked)")
+        fixes.append("The bot owner must make a new SESSION_STRING for the assistant.")
+    elif st == ChatMemberStatus.BANNED:
+        lines.append(f"🚫 Assistant {tag} is BANNED in this group")
+        fixes.append(f"Unban {tag} (group's 'Removed users' list).")
+    elif st is None or st == ChatMemberStatus.LEFT:
+        lines.append(f"{bad} Assistant {tag} is not in this group")
+        fixes.append("Send /play and I will add it myself (needs 'Invite users'), or add "
+                     f"{tag} to the group by hand.")
+    else:
+        lines.append(f"{ok} Assistant {tag} is in the group")
+        if st in ADM and _right(am, "can_manage_video_chats") is False:
+            lines.append(f"{warn} Assistant cannot start a voice chat (no 'Manage video chats')")
+    if not a.dead and not a.healthy:
+        lines.append(f"{warn} Assistant is resting right now ({a.status})")
+
+    # 3) the voice chat
+    vc = await _voice_chat_active(chat_id)
+    if vc is True:
+        lines.append(f"{ok} Voice chat is running")
+    elif vc is False:
+        lines.append(f"{warn} No voice chat is running")
+        fixes.append("Start a voice chat in the group (or make the assistant admin with "
+                     "'Manage video chats' so it can start one).")
+    else:
+        lines.append("❔ Could not check the voice chat")
+
+    on = lambda b: "ON" if b else "OFF"
+    lines += ["", f"🎙 Voice chat notices: {on(_setting_on(chat_id, 'vcnotice', VC_NOTICE_DEFAULT))} (/vcnotice)",
+              f"👋 Welcome messages: {on(_setting_on(chat_id, 'welcome', WELCOME_DEFAULT))} (/welcome)", ""]
+    if fixes:
+        lines.append("<b>To fix:</b>")
+        lines += [f"• {html.escape(f)}" for f in fixes]
+    else:
+        lines.append("🎉 Everything is ready. Send /play song name")
+    await m.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
+
+
+async def _voice_chat_active(chat_id: int):
+    """True / False, or None if it cannot be checked."""
+    try:
+        chat = await bot.get_chat(chat_id)
+        v = getattr(chat, "is_call_active", None)
+        return None if v is None else bool(v)
+    except Exception:
+        return None
+
+
+# ---------------- Background jobs: assistant health, idle leave, DB flush ----------------
+async def assistant_health_loop():
+    """Every 5 min: is each assistant session still alive? A dead one is marked (panel + owner alert)."""
+    while True:
+        await asyncio.sleep(300)
+        for a in ASSISTANTS:
+            if a.dead:
+                continue
+            try:
+                await asyncio.wait_for(a.client.get_me(), 30)
+            except Exception as ex:
+                if any(k in type(ex).__name__ for k in DEAD_ERRORS):
+                    _mark_dead(a, ex)
+                else:  # network hiccup: not dead, just log it
+                    log.warning("assistant %s health check failed: %s %s", a.tag, type(ex).__name__, ex)
+
+
+async def idle_leave_once() -> int:
+    """One round: assistants leave groups unused for IDLE_LEAVE_DAYS. Returns how many were left."""
+    rows = await asyncio.to_thread(db.assign_idle, time.time() - IDLE_LEAVE_DAYS * 86400)
+    left = 0
+    for chat_id, aid in rows:
+        a = ASSISTANT_BY_ID.get(aid)
+        if a is None or a.dead or queues.get(chat_id):
+            continue
+        try:
+            await a.client.leave_chat(chat_id)
+        except Exception as ex:
+            if not any(k in type(ex).__name__ for k in
+                       ("UserNotParticipant", "ChannelPrivate", "ChatForbidden", "PeerIdInvalid",
+                        "ChannelInvalid")):
+                log.warning("idle leave failed in %s: %s %s", chat_id, type(ex).__name__, ex)
+                continue  # a real error: keep the assignment, try again next round
+        if _assigned.get(chat_id) is a:
+            _assigned.pop(chat_id, None)
+            a.chats = max(0, a.chats - 1)
+        _joined.discard(chat_id)
+        db.assign_delete(chat_id)
+        left += 1
+        await asyncio.sleep(3)  # spread out: no FloodWait
+    if left:
+        log.info("assistants left %s idle groups", left)
+        for a in ASSISTANTS:
+            a.full_until = 0.0  # slots are free again
+    return left
+
+
+async def idle_leave_loop():
+    """Assistants leave groups that did not play a song for IDLE_LEAVE_DAYS: keeps the account far
+    from Telegram's group limit. They come back by themselves on the next /play."""
+    if IDLE_LEAVE_DAYS <= 0:
+        return
+    await asyncio.sleep(600)
+    while True:
+        try:
+            await idle_leave_once()
+        except Exception as ex:
+            log.warning("idle leave loop error: %s", ex)
+        await asyncio.sleep(6 * 3600)
+
+
+async def flush_loop():
+    """Hit counts and last_used times are kept in RAM and written once a minute."""
+    while True:
+        await asyncio.sleep(60)
+        try:
+            await asyncio.to_thread(db.flush_buffers)
+        except Exception as ex:
+            log.warning("db flush failed: %s", ex)
+
+
+def assistants_info() -> list[dict]:
+    """For the admin panel."""
+    return [{"tag": a.tag, "status": a.status, "groups": a.chats, "error": a.last_error}
+            for a in ASSISTANTS]
 
 
 # ---------------- Radio ----------------
@@ -1083,8 +1710,24 @@ async def main():
     else:
         log.info("STORAGE_CHANNEL not set: every song comes from YouTube")
     for a in ASSISTANTS:
-        await a.client.start()
-        await a.call.start()
+        # One broken assistant must not take the whole bot down: retry, then mark it dead and go on.
+        for attempt in range(3):
+            try:
+                await a.client.start()
+                await a.call.start()
+                a.uid = (a.client.me or await a.client.get_me()).id
+                ASSISTANT_BY_ID[a.uid] = a
+                break
+            except Exception as ex:
+                if any(k in type(ex).__name__ for k in DEAD_ERRORS) or attempt == 2:
+                    _mark_dead(a, ex)
+                    break
+                log.warning("assistant %s failed to start (%s %s), retrying", a.tag, type(ex).__name__, ex)
+                await asyncio.sleep(5)
+    if all(a.dead for a in ASSISTANTS):
+        raise SystemExit("No assistant could start. Check SESSION_STRING(S).")
+    load_assignments()
+    panel.assistants_fn = assistants_info
     panel.library = {
         "total_songs": sum(len(v) for v in LANG_ALL.values()),
         "total_singers": sum(len(v) for v in ARTISTS.values()),
@@ -1095,10 +1738,17 @@ async def main():
     spawn(panel.cleanup_loop())
     spawn(media.evict_loop())
     spawn(watchdog_loop())
+    spawn(assistant_health_loop())
+    spawn(idle_leave_loop())
+    spawn(flush_loop())
     log.info("Bot is running as @%s | assistants: %s | radio languages: %s",
              BOT_USERNAME, [a.tag for a in ASSISTANTS], LANGS)
     await idle()
     await notify_shutdown()
+    try:
+        db.flush_buffers()  # save buffered hit counts / last_used before exit
+    except Exception:
+        pass
 
 
 if __name__ == "__main__":
